@@ -1,0 +1,16 @@
+name = "primemods-website"
+main = "_worker.js"
+compatibility_date = "2026-08-04"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# /downloads serves public/downloads.html
+html_handling = "auto-trailing-slash"
+not_found_handling = "none"
+
+# Set these in the dashboard (Settings → Variables and Secrets) or via
+#   npx wrangler secret put PATREON_CLIENT_SECRET
+#   npx wrangler secret put COOKIE_SECRET
+[vars]
+PATREON_CLIENT_ID = "Ue5jWqFIGGAg5mR1pytqQ0eijnDahZoNDzg-QGMNQSs6_ABGukv0cWaLzdUcx4eo"
