@@ -9,6 +9,7 @@
 //   PACKS                  R2 bucket holding the pack part zips
 // Optional:
 //   OWNER_IDS              comma-separated Patreon user ids with full access
+//   TEAM_IDS               same, for team members
 
 import { handleDownload } from './download.js';
 
@@ -18,7 +19,7 @@ const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
   '?include=memberships.currently_entitled_tiers' +
   '&fields%5Bmember%5D=patron_status' +
-  '&fields%5Buser%5D=full_name';
+  '&fields%5Buser%5D=full_name,image_url,thumb_url';
 
 const TIERS = {
   supporter:  '5962086',
@@ -89,6 +90,8 @@ async function callback(url, env) {
 
   const uid = String(body?.data?.id || '');
   const name = body?.data?.attributes?.full_name || 'Patron';
+  const avatar = body?.data?.attributes?.thumb_url ||
+                 body?.data?.attributes?.image_url || '';
   const entitled = [];
   for (const inc of body.included || []) {
     if (inc.type !== 'member') continue;
@@ -98,13 +101,16 @@ async function callback(url, env) {
     }
   }
 
-  // OWNER_IDS: comma-separated Patreon user ids that always get full access,
-  // regardless of what they're subscribed to.
-  const owner = (env.OWNER_IDS || '')
-    .split(',').map(s => s.trim()).filter(Boolean).includes(uid);
+  // OWNER_IDS / TEAM_IDS: comma-separated Patreon user ids that always get
+  // full access, regardless of what they're subscribed to.
+  const idList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+  const owner = idList(env.OWNER_IDS).includes(uid);
+  const team = !owner && idList(env.TEAM_IDS).includes(uid);
+  const staff = owner || team;
 
   const has = t => entitled.includes(t);
   const tier = owner ? 'Creator'
+    : team ? 'Team Member'
     : has(TIERS.devCouncil) ? 'Development Council'
     : has(TIERS.packTester) ? 'Pack Tester'
     : 'Supporter';
@@ -112,11 +118,12 @@ async function callback(url, env) {
   const session = {
     uid,
     name,
+    avatar,
     tier,
     tiers: entitled,
-    owner,
-    paid: owner || entitled.some(t => PAID.includes(t)),
-    early: owner || entitled.some(t => EARLY_ACCESS.includes(t)),
+    owner, team,
+    paid: staff || entitled.some(t => PAID.includes(t)),
+    early: staff || entitled.some(t => EARLY_ACCESS.includes(t)),
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7
   };
 
@@ -130,7 +137,8 @@ async function me(request, env) {
   return json(
     s
       ? { signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
-          paid: !!s.paid, early: !!s.early, owner: !!s.owner, tiers: s.tiers }
+          avatar: s.avatar || '', paid: !!s.paid, early: !!s.early,
+          owner: !!s.owner, team: !!s.team, tiers: s.tiers }
       : { signedIn: false }
   );
 }

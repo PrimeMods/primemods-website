@@ -51,7 +51,7 @@ export async function handleDownload(request, env, session) {
 
   const sources = [{ label: 'base', key: `base/${res}.zip` }];
   for (const s of slugs) sources.push({ label: ADDONS[s], key: `addons/${s}.zip` });
-  if (early) sources.push({ label: 'Early access', key: `early/${res}.zip` });
+  if (early) sources.push({ label: 'Early access', key: `early/${res}.zip`, early: true });
 
   for (const s of sources) {
     const h = await env.PACKS.head(s.key);
@@ -69,15 +69,14 @@ export async function handleDownload(request, env, session) {
   if (check)
     return json({ ok: true, files: plan.entries.length, bytes: plan.totalBytes, sources: sources.length });
 
-  const filename = 'PrimesHDTextures_' + res + 'x' +
-    (slugs.length ? '+' + slugs.length + 'addons' : '') +
-    (early ? '_EarlyAccess' : '') + '_' + BUILD_LABEL.replace(/\s+/g, '') + '.zip';
+  const filename = `Prime's HD Textures [${res}x].zip`;
 
   return new Response(streamZip(env, plan), {
     headers: {
       'content-type': 'application/zip',
       'content-length': String(plan.totalBytes),
-      'content-disposition': `attachment; filename="${filename}"`,
+      'content-disposition': `attachment; filename="Primes HD Textures [${res}x].zip"; ` +
+        `filename*=UTF-8''${encodeURIComponent(filename)}`,
       'cache-control': 'no-store',
       'x-build-id': plan.buildId
     }
@@ -105,15 +104,16 @@ async function buildPlan(env, sources, opts) {
 
   // Generated entries replace / add to what came out of the zips.
   const generated = [];
-  const meta = await packMeta(env, sources[0], opts, buildId);
+  const meta = await packMeta(env, sources, opts, buildId);
   if (meta) { generated.push(meta); owner.delete('pack.mcmeta'); }
-  generated.push(storedEntry('phdt_build.txt', buildInfo(opts, buildId, sources)));
 
   // Output order: base entries first, then each overlay's new files.
   const entries = [];
+  const seen = new Set();
   sources.forEach((s, si) => {
     for (const e of s.index.entries) {
-      if (e.dir || owner.get(e.name) !== si) continue;
+      if (e.dir || owner.get(e.name) !== si || seen.has(e.name)) continue;
+      seen.add(e.name);
       entries.push({ ...e, sourceIndex: si });
     }
   });
@@ -133,31 +133,40 @@ async function buildPlan(env, sources, opts) {
     dirSize += 46 + e.nameBytes.length + (e.zip64 ? 12 : 0);
   }
   const needZip64 = dirStart + dirSize > 0xFFFFFFFE || entries.length > 0xFFFE;
-  const comment = new TextEncoder().encode('PHDT-' + buildId);
-  const totalBytes = dirStart + dirSize +
+  const comment = new TextEncoder().encode('PHDT-' + buildId);  const totalBytes = dirStart + dirSize +
     (needZip64 ? 56 + 20 : 0) + 22 + comment.length;
 
   return { sources, entries, dirStart, dirSize, needZip64, comment, totalBytes, buildId };
 }
 
-/* Rewrites pack.mcmeta so the in-game pack list names what was built. The
-   file is a couple hundred bytes, so inflating it is free. Build ID rides
-   along in a custom key Minecraft ignores. */
-async function packMeta(env, base, opts, buildId) {
+/* Rewrites pack.mcmeta so the in-game pack list describes what was built:
+   every source's own description joined with " + ", base first, then early
+   access, then the add-ons. The files are a few hundred bytes, so inflating
+   them is free. */
+async function packMeta(env, sources, opts, buildId) {
   try {
-    const e = base.index.entries.find(x => x.name === 'pack.mcmeta');
-    if (!e) return null;
-    let bytes = await readEntryBytes(env.PACKS, base.key, e);
-    if (e.method === 8) bytes = await inflateRaw(bytes);
-    else if (e.method !== 0) return null;
-    const meta = JSON.parse(new TextDecoder().decode(bytes));
-    if (!meta.pack) return null;
+    const base = sources[0];
+    const baseEntry = base.index.entries.find(x => x.name === 'pack.mcmeta');
+    if (!baseEntry) return null;
+    const meta = await readMcmeta(env, base, baseEntry);
+    if (!meta || !meta.pack) return null;
 
-    const bits = [opts.res + '×'];
-    for (const s of opts.slugs) bits.push(ADDONS[s]);
-    if (opts.early) bits.push('Early access');
-    meta.pack.description = `Prime's HD Textures ${BUILD_LABEL}\n§7${bits.join(' · ')}`;
-    meta.phdt = { build: BUILD_LABEL, id: buildId };
+    // Base, then early access, then add-ons — matching how they layer.
+    const ordered = [base,
+      ...sources.filter(s => s.early),
+      ...sources.filter((s, i) => i > 0 && !s.early)];
+
+    const parts = [];
+    for (const s of ordered) {
+      const e = s.index.entries.find(x => x.name === 'pack.mcmeta');
+      const m = s === base ? meta : (e ? await readMcmeta(env, s, e) : null);
+      const d = describe(m);
+      if (d && !parts.includes(d)) parts.push(d);
+    }
+
+    meta.pack.description = parts.join(' + ');
+    delete meta.phdt;
+    meta.build_id = buildId;
 
     return storedEntry('pack.mcmeta', JSON.stringify(meta, null, 2));
   } catch (e) {
@@ -165,17 +174,20 @@ async function packMeta(env, base, opts, buildId) {
   }
 }
 
-function buildInfo(opts, buildId, sources) {
-  return `Prime's HD Textures\r\n` +
-    `Build: ${BUILD_LABEL} · ${MC_LABEL}\r\n` +
-    `Resolution: ${opts.res}x\r\n` +
-    `Add-ons: ${opts.slugs.length ? opts.slugs.map(s => ADDONS[s]).join(', ') : 'none'}\r\n` +
-    `Early access: ${opts.early ? 'yes' : 'no'}\r\n` +
-    `Layers: ${sources.map(s => s.label).join(' -> ')}\r\n` +
-    `Packaged: ${new Date().toISOString()}\r\n` +
-    `Build ID: ${buildId}\r\n\r\n` +
-    `This copy was built for a single Patreon supporter and the Build ID above\r\n` +
-    `identifies the account it was issued to. Please don't redistribute it.\r\n`;
+async function readMcmeta(env, src, e) {
+  let bytes = await readEntryBytes(env.PACKS, src.key, e);
+  if (e.method === 8) bytes = await inflateRaw(bytes);
+  else if (e.method !== 0) return null;
+  try { return JSON.parse(new TextDecoder().decode(bytes)); } catch (x) { return null; }
+}
+
+// pack.mcmeta descriptions can be a plain string or a JSON text component.
+function describe(meta) {
+  const d = meta && meta.pack && meta.pack.description;
+  if (typeof d === 'string') return d.trim();
+  if (Array.isArray(d)) return d.map(p => typeof p === 'string' ? p : (p && p.text) || '').join('').trim();
+  if (d && typeof d.text === 'string') return d.text.trim();
+  return '';
 }
 
 /* ---------------- output stream ---------------- */
@@ -260,6 +272,7 @@ class ByteStream {
   }
   async skipTo(target) {
     let n = target - this.pos;
+    if (n < 0) throw new Error('pack entries are out of order');
     while (n > 0) {
       if (!this.buf.length) await this.fill();
       const take = Math.min(n, this.buf.length);
@@ -301,8 +314,10 @@ async function readZipIndex(bucket, key, size) {
   let count = rd16(tail, eocd + 10);
   let dirSize = rd32(tail, eocd + 12);
   let dirOffset = rd32(tail, eocd + 16);
+  const eocdPos = size - tailLen + eocd;
+  let cdEnd = eocdPos;
 
-  if (dirOffset === 0xFFFFFFFF || count === 0xFFFF) {
+  if (dirOffset === 0xFFFFFFFF || count === 0xFFFF || dirSize === 0xFFFFFFFF) {
     let loc = -1;
     for (let i = eocd - 20; i >= 0; i--) {
       if (rd32(tail, i) === 0x07064b58) { loc = i; break; }
@@ -313,9 +328,16 @@ async function readZipIndex(bucket, key, size) {
     count = Number(rd64(z64, 32));
     dirSize = Number(rd64(z64, 40));
     dirOffset = Number(rd64(z64, 48));
+    cdEnd = z64at;
   }
 
-  const dir = await range(bucket, key, dirOffset, dirSize);
+  // Some zips carry a prefix (self-extracting stubs, or an archive appended to
+  // another file), which shifts every recorded offset. Work out the real start
+  // of the central directory and correct by the difference.
+  const actualDirStart = cdEnd - dirSize;
+  const prefix = actualDirStart - dirOffset;
+
+  const dir = await range(bucket, key, actualDirStart, dirSize);
   const entries = [];
   let p = 0;
   for (let n = 0; n < count; n++) {
@@ -356,14 +378,27 @@ async function readZipIndex(bucket, key, size) {
       name: name.replace(/\\/g, '/'),
       dir: name.endsWith('/'),
       method, crc, compSize, uncompSize,
-      srcOffset: localOffset,
+      srcOffset: localOffset + prefix,
       utf8: !!(flags & 0x0800)
     });
     p += 46 + nameLen + extraLen + commentLen;
   }
 
   entries.sort((a, b) => a.srcOffset - b.srcOffset);
-  return { entries, dirOffset };
+
+  // Validate before we commit to streaming: once response headers are out, a
+  // failure can only truncate the download.
+  const files = entries.filter(e => !e.dir);
+  if (files.length) {
+    const probe = await range(bucket, key, files[0].srcOffset, 4);
+    if (rd32(probe, 0) !== 0x04034b50)
+      throw new Error(key + ' has unreadable entry offsets');
+    const last = files[files.length - 1];
+    if (last.srcOffset + last.compSize > actualDirStart)
+      throw new Error(key + ' is truncated or its directory is inconsistent');
+  }
+
+  return { entries, dirOffset: actualDirStart };
 }
 
 async function readEntryBytes(bucket, key, e) {
@@ -477,20 +512,11 @@ function endRecord(plan) {
 }
 
 /* ---------------- stamp ----------------
-   An HMAC of the patron's identity, not the name itself. Nothing personal
-   lands in the file, but you can trace a leaked build by running the same
-   HMAC over your patron list and matching the ID. */
+   The patron's Patreon user id, written into pack.mcmeta as build_id and into
+   the zip's archive comment. Look the id up in your Patreon dashboard to see
+   which account a leaked build came from. */
 async function stamp(session, env) {
-  const seed = session
-    ? (session.name || '') + '|' + (session.tiers || []).join(',')
-    : 'anonymous';
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(env.COOKIE_SECRET || 'dev-only-insecure-secret'),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(seed));
-  const hex = [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
-  return hex.slice(0, 16).toUpperCase().replace(/(.{4})(?=.)/g, '$1-');
+  return session && session.uid ? String(session.uid) : 'anonymous';
 }
 
 /* ---------------- crc32 ---------------- */

@@ -21,3 +21,4 @@ bucket_name = "primes-hd-textures"
 [vars]
 PATREON_CLIENT_ID = "Ue5jWqFIGGAg5mR1pytqQ0eijnDahZoNDzg-QGMNQSs6_ABGukv0cWaLzdUcx4eo"
 OWNER_IDS = "42536237"
+TEAM_IDS = ""
