@@ -5,9 +5,15 @@ compatibility_date = "2026-08-04"
 [assets]
 directory = "./public"
 binding = "ASSETS"
-# /downloads serves public/downloads.html
+# /downloads serves public/downloads/index.html
 html_handling = "auto-trailing-slash"
 not_found_handling = "none"
+
+# R2 bucket holding the pack part zips. Create it first:
+#   npx wrangler r2 bucket create primes-hd-textures
+[[r2_buckets]]
+binding = "PACKS"
+bucket_name = "primes-hd-textures"
 
 # Set these in the dashboard (Settings → Variables and Secrets) or via
 #   npx wrangler secret put PATREON_CLIENT_SECRET

@@ -5,6 +5,10 @@
 //   PATREON_CLIENT_ID      plain text
 //   PATREON_CLIENT_SECRET  secret
 //   COOKIE_SECRET          secret (any long random string)
+// Required binding:
+//   PACKS                  R2 bucket holding the pack part zips
+
+import { handleDownload } from './download.js';
 
 const AUTHORIZE = 'https://www.patreon.com/oauth2/authorize';
 const TOKEN_URL = 'https://www.patreon.com/api/oauth2/token';
@@ -34,6 +38,7 @@ export default {
     if (p === '/api/patreon/callback') return callback(url, env);
     if (p === '/api/patreon/me')       return me(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
+    if (p === '/api/download')         return handleDownload(request, env, await readCookie(request, env));
 
     return env.ASSETS.fetch(request);
   }
