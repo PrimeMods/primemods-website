@@ -347,8 +347,10 @@ async function readZipIndex(bucket, key, size) {
       }
     }
 
-    if (flags & 0x0008)
-      throw new Error(key + ': ' + name + ' uses a streamed data descriptor — re-zip the pack');
+    // Entries written with a streamed data descriptor (flag bit 3) have zeroed
+    // sizes in their LOCAL header, but the central directory values above are
+    // authoritative — and we re-emit our own headers from those. The trailing
+    // descriptor is simply skipped, since we seek to each entry by offset.
 
     entries.push({
       name: name.replace(/\\/g, '/'),
