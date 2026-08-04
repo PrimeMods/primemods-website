@@ -7,6 +7,8 @@
 //   COOKIE_SECRET          secret (any long random string)
 // Required binding:
 //   PACKS                  R2 bucket holding the pack part zips
+// Optional:
+//   OWNER_IDS              comma-separated Patreon user ids with full access
 
 import { handleDownload } from './download.js';
 
@@ -21,8 +23,8 @@ const IDENTITY =
 const TIERS = {
   supporter:  '5962086',
   packTester: '9234196',
-  devCouncil: '25863509',
-  legacy:     '5960935'
+  devCouncil: '6201011',
+  legacy:     '5960935'  // deprecated tier — treated exactly as Supporter
 };
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
 const PAID = Object.values(TIERS);
@@ -85,6 +87,7 @@ async function callback(url, env) {
   if (!idRes.ok) return text(`Identity fetch failed: ${await idRes.text()}`, 502);
   const body = await idRes.json();
 
+  const uid = String(body?.data?.id || '');
   const name = body?.data?.attributes?.full_name || 'Patron';
   const entitled = [];
   for (const inc of body.included || []) {
@@ -95,11 +98,25 @@ async function callback(url, env) {
     }
   }
 
+  // OWNER_IDS: comma-separated Patreon user ids that always get full access,
+  // regardless of what they're subscribed to.
+  const owner = (env.OWNER_IDS || '')
+    .split(',').map(s => s.trim()).filter(Boolean).includes(uid);
+
+  const has = t => entitled.includes(t);
+  const tier = owner ? 'Creator'
+    : has(TIERS.devCouncil) ? 'Development Council'
+    : has(TIERS.packTester) ? 'Pack Tester'
+    : 'Supporter';
+
   const session = {
+    uid,
     name,
+    tier,
     tiers: entitled,
-    paid: entitled.some(t => PAID.includes(t)),
-    early: entitled.some(t => EARLY_ACCESS.includes(t)),
+    owner,
+    paid: owner || entitled.some(t => PAID.includes(t)),
+    early: owner || entitled.some(t => EARLY_ACCESS.includes(t)),
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7
   };
 
@@ -112,7 +129,8 @@ async function me(request, env) {
   const s = await readCookie(request, env);
   return json(
     s
-      ? { signedIn: true, name: s.name, paid: !!s.paid, early: !!s.early, tiers: s.tiers }
+      ? { signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
+          paid: !!s.paid, early: !!s.early, owner: !!s.owner, tiers: s.tiers }
       : { signedIn: false }
   );
 }
