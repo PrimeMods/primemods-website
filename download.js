@@ -46,7 +46,7 @@ export async function handleDownload(request, env, session) {
   if (res !== 32 && !paid) return err('64× and up need a paid Patreon tier.', check, 403);
   if (slugs.length && !paid) return err('Add-ons need a paid Patreon tier.', check, 403);
   if (early && !canEarly)
-    return err('Early access is for Pack Tester and Development Council members.', check, 403);
+    return err('Early access is for Beta Tester and Development Council members.', check, 403);
   if (!env.PACKS) return err('File storage isn\u2019t configured yet.', check, 503);
 
   const sources = [{ label: 'base', key: `base/${res}.zip` }];

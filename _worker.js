@@ -114,7 +114,7 @@ async function callback(url, env) {
   const tier = owner ? 'Creator'
     : team ? 'Team Member'
     : has(TIERS.devCouncil) ? 'Development Council'
-    : has(TIERS.packTester) ? 'Pack Tester'
+    : has(TIERS.packTester) ? 'Beta Tester'
     : 'Supporter';
 
   const session = {
