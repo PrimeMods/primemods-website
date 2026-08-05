@@ -14,8 +14,8 @@
 //   addons/<slug>.zip              one file each, resolution agnostic
 //   early/<res>.zip
 
+import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
-
 // Overlay order: later sources override earlier ones on a path collision.
 const ADDONS = {
   'lush-foliage':   'Lush Foliage',
@@ -139,10 +139,9 @@ async function buildPlan(env, sources, opts) {
   return { sources, entries, dirStart, dirSize, needZip64, comment, totalBytes, buildId };
 }
 
-/* Rewrites pack.mcmeta so the in-game pack list describes what was built:
-   every source's own description joined with " + ", base first, then early
-   access, then the add-ons. The files are a few hundred bytes, so inflating
-   them is free. */
+/* Rewrites pack.mcmeta so the in-game pack list describes what was built.
+   Early access replaces the base description; each add-on's own description is
+   appended with " + ". */
 async function packMeta(env, sources, opts, buildId) {
   try {
     const base = sources[0];
@@ -151,16 +150,20 @@ async function packMeta(env, sources, opts, buildId) {
     const meta = await readMcmeta(env, base, baseEntry);
     if (!meta || !meta.pack) return null;
 
-    // Base, then early access, then add-ons — matching how they layer.
-    const ordered = [base,
-      ...sources.filter(s => s.early),
-      ...sources.filter((s, i) => i > 0 && !s.early)];
+    // Early access replaces the base description; add-ons append to it.
+    const earlySrc = sources.find(s => s.early);
+    const addonSrcs = sources.filter((s, i) => i > 0 && !s.early);
 
-    const parts = [];
-    for (const s of ordered) {
+    const descOf = async s => {
+      if (s === base) return describe(meta);
       const e = s.index.entries.find(x => x.name === 'pack.mcmeta');
-      const m = s === base ? meta : (e ? await readMcmeta(env, s, e) : null);
-      const d = describe(m);
+      return e ? describe(await readMcmeta(env, s, e)) : '';
+    };
+
+    const head = earlySrc ? (await descOf(earlySrc)) || describe(meta) : describe(meta);
+    const parts = head ? [head] : [];
+    for (const s of addonSrcs) {
+      const d = await descOf(s);
       if (d && !parts.includes(d)) parts.push(d);
     }
 
@@ -512,11 +515,16 @@ function endRecord(plan) {
 }
 
 /* ---------------- stamp ----------------
-   The patron's Patreon user id, written into pack.mcmeta as build_id and into
-   the zip's archive comment. Look the id up in your Patreon dashboard to see
-   which account a leaked build came from. */
+   The patron's Patreon user id, encrypted with COOKIE_SECRET. Anyone who finds
+   it in a leaked pack learns nothing; decode it at /api/build-id to get the
+   account. */
 async function stamp(session, env) {
-  return session && session.uid ? String(session.uid) : 'anonymous';
+  if (!session || !session.uid) return 'anonymous';
+  try {
+    return await encodeBuildId(session.uid, env.COOKIE_SECRET || 'dev-only-insecure-secret');
+  } catch (e) {
+    return 'anonymous';
+  }
 }
 
 /* ---------------- crc32 ---------------- */
