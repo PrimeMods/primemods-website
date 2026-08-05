@@ -10,6 +10,8 @@
 // Optional:
 //   OWNER_IDS              comma-separated Patreon user ids with full access
 //   TEAM_IDS               same, for team members
+//   PATREON_CREATOR_TOKEN  secret; enables /api/whois leak lookup
+//   PATREON_CAMPAIGN_ID    optional; discovered automatically if omitted
 
 import { handleDownload } from './download.js';
 
@@ -41,6 +43,7 @@ export default {
     if (p === '/api/patreon/callback') return callback(url, env);
     if (p === '/api/patreon/me')       return me(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
+    if (p === '/api/whois')            return whois(request, env, url);
     if (p === '/api/download')         return handleDownload(request, env, await readCookie(request, env));
 
     return env.ASSETS.fetch(request);
@@ -143,8 +146,75 @@ async function me(request, env) {
   );
 }
 
-function logout(url) {
-  const res = new Response(null, { status: 302, headers: { location: '/' } });
+/* ---------- leak lookup ----------
+   /api/whois?id=12345678 turns a build_id out of a leaked pack into the patron
+   it was issued to. Owner and team sessions only.
+
+   Needs PATREON_CREATOR_TOKEN (secret) — your client's own Creator's Access
+   Token, from patreon.com/portal/registration/register-clients. The campaign
+   is discovered automatically. */
+async function whois(request, env, url) {
+  const s = await readCookie(request, env);
+  if (!s || !(s.owner || s.team)) return json({ error: 'Not authorised.' }, 403);
+
+  const id = (url.searchParams.get('id') || '').trim();
+  if (!id) return json({ error: 'Pass ?id= the build_id from the pack.' }, 400);
+  if (!env.PATREON_CREATOR_TOKEN) return json({ error: 'PATREON_CREATOR_TOKEN is not set.' }, 503);
+
+  const auth = { authorization: `Bearer ${env.PATREON_CREATOR_TOKEN}` };
+
+  let campaign = env.PATREON_CAMPAIGN_ID;
+  if (!campaign) {
+    const r = await fetch('https://www.patreon.com/api/oauth2/v2/campaigns', { headers: auth });
+    if (!r.ok) return json({ error: 'Campaign lookup failed: ' + await r.text() }, 502);
+    campaign = (await r.json())?.data?.[0]?.id;
+    if (!campaign) return json({ error: 'No campaign found for that token.' }, 502);
+  }
+
+  // Page through the member list looking for that user id.
+  let next = `https://www.patreon.com/api/oauth2/v2/campaigns/${campaign}/members` +
+    '?include=user,currently_entitled_tiers' +
+    '&fields%5Bmember%5D=full_name,email,patron_status,pledge_relationship_start,lifetime_support_cents' +
+    '&fields%5Btier%5D=title&page%5Bcount%5D=500';
+
+  for (let page = 0; next && page < 40; page++) {
+    const r = await fetch(next, { headers: auth });
+    if (!r.ok) return json({ error: 'Member lookup failed: ' + await r.text() }, 502);
+    const body = await r.json();
+
+    const tierNames = new Map();
+    for (const inc of body.included || []) {
+      if (inc.type === 'tier') tierNames.set(inc.id, inc.attributes?.title);
+    }
+
+    for (const m of body.data || []) {
+      if (String(m.relationships?.user?.data?.id) !== id) continue;
+      const a = m.attributes || {};
+      return json({
+        found: true,
+        userId: id,
+        name: a.full_name,
+        email: a.email,
+        status: a.patron_status,
+        since: a.pledge_relationship_start,
+        lifetimeSupportCents: a.lifetime_support_cents,
+        tiers: (m.relationships?.currently_entitled_tiers?.data || [])
+          .map(t => tierNames.get(t.id) || t.id),
+        profile: `https://www.patreon.com/user?u=${id}`
+      });
+    }
+    next = body.links?.next || null;
+  }
+
+  return json({
+    found: false,
+    userId: id,
+    note: 'No current or former patron on your campaign has that user id.',
+    profile: `https://www.patreon.com/user?u=${id}`
+  });
+}
+
+function logout(url) {  const res = new Response(null, { status: 302, headers: { location: '/' } });
   res.headers.append(
     'set-cookie',
     `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`
