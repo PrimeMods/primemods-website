@@ -18,7 +18,7 @@ const AUTHORIZE = 'https://www.patreon.com/oauth2/authorize';
 const TOKEN_URL = 'https://www.patreon.com/api/oauth2/token';
 const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
-  '?include=memberships.currently_entitled_tiers' +
+  '?include=memberships.currently_entitled_tiers,campaign' +
   '&fields%5Bmember%5D=patron_status' +
   '&fields%5Buser%5D=full_name,image_url,thumb_url';
 
@@ -29,7 +29,6 @@ const TIERS = {
   legacy:     '5960935'  // deprecated tier — treated exactly as Supporter
 };
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
-const PAID = Object.values(TIERS);
 
 const COOKIE = 'phdt';
 
@@ -61,7 +60,7 @@ function login(url, env) {
     response_type: 'code',
     client_id: env.PATREON_CLIENT_ID,
     redirect_uri: redirectUri(url),
-    scope: 'identity identity.memberships'
+    scope: 'identity identity.memberships campaigns'
   });
   return Response.redirect(`${AUTHORIZE}?${q}`, 302);
 }
@@ -106,7 +105,11 @@ async function callback(url, env) {
   // OWNER_IDS / TEAM_IDS: comma-separated Patreon user ids that always get
   // full access, regardless of what they're subscribed to.
   const idList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
-  const owner = idList(env.OWNER_IDS).includes(uid);
+  // A creator holds no membership to their own campaign, so tier checks can
+  // never pass for them. The identity payload does name the campaign they own.
+  const ownsCampaign = !!body?.data?.relationships?.campaign?.data ||
+    (body.included || []).some(i => i.type === 'campaign');
+  const owner = ownsCampaign || idList(env.OWNER_IDS).includes(uid);
   const team = !owner && idList(env.TEAM_IDS).includes(uid);
   const staff = owner || team;
 
@@ -115,7 +118,8 @@ async function callback(url, env) {
     : team ? 'Team Member'
     : has(TIERS.devCouncil) ? 'Development Council'
     : has(TIERS.packTester) ? 'Beta Tester'
-    : 'Supporter';
+    : entitled.length ? 'Supporter'
+    : 'Free';
 
   const session = {
     uid,
@@ -124,7 +128,10 @@ async function callback(url, env) {
     tier,
     tiers: entitled,
     owner, team,
-    paid: staff || entitled.some(t => PAID.includes(t)),
+    // Any active entitled tier counts as paid. Matching against a hardcoded
+    // list of tier ids silently locks out patrons whenever a tier is added or
+    // re-created on Patreon, which is what it did to Supporters.
+    paid: staff || entitled.length > 0,
     early: staff || entitled.some(t => EARLY_ACCESS.includes(t)),
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7
   };
