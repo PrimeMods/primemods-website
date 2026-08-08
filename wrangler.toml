@@ -28,4 +28,4 @@ PATREON_CLIENT_ID = "Ue5jWqFIGGAg5mR1pytqQ0eijnDahZoNDzg-QGMNQSs6_ABGukv0cWaLzdU
 # Optional. The creator account is detected automatically from the campaign it
 # owns; these are for extra accounts that should always have full access.
 OWNER_IDS = ""
-TEAM_IDS = ""
+TEAM_IDS = "28982945,165344659,135944510,21501443"
