@@ -117,7 +117,7 @@ async function callback(url, env) {
   const tier = owner ? 'Creator'
     : team ? 'Team Member'
     : has(TIERS.devCouncil) ? 'Development Council'
-    : has(TIERS.packTester) ? 'Beta Tester'
+    : has(TIERS.packTester) ? 'Pack Tester'
     : entitled.length ? 'Supporter'
     : 'Free';
 
@@ -176,7 +176,12 @@ async function buildIdLookup(request, env, url) {
   }
 }
 
-function logout(url) {  const res = new Response(null, { status: 302, headers: { location: '/' } });
+function logout(url) {
+  // Stay on whatever page the visitor signed out from. Only same-origin paths
+  // are honoured, so ?next= can't be used as an open redirect.
+  const next = url.searchParams.get('next') || '/';
+  const dest = /^\/(?!\/)/.test(next) ? next : '/';
+  const res = new Response(null, { status: 302, headers: { location: dest } });
   res.headers.append(
     'set-cookie',
     `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`
