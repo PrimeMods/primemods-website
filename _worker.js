@@ -32,6 +32,71 @@ const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
 
 const COOKIE = 'phdt';
 
+// The built pages are self-unpacking bundles: everything except <title> lives
+// inside a template string that only exists once JavaScript runs. Crawlers and
+// link unfurlers (Discord, X, Google's first pass) don't run it, so the head
+// they see is otherwise empty. These tags are injected server-side instead, and
+// because they're derived from the request host, one build is correct on any
+// domain — the beta subdomain gets noindex and its own canonical automatically.
+const LIVE_HOST = 'primemods.net';
+
+const PAGE_META = {
+  '/': {
+    desc: "Every vanilla Minecraft texture hand-drawn up to 256\u00d7, with full PBR and 3D depth. Free 32\u00d7 pack, higher resolutions and add-ons on Patreon.",
+    ogTitle: "Prime's HD Textures",
+    ogDesc: "Minecraft's vanilla textures, just uh\u2026 without the pixels."
+  },
+  '/downloads': {
+    desc: "Build your copy of Prime's HD Textures: pick a resolution from 32\u00d7 to 256\u00d7, add Lush Foliage, PBR Items or Block Overlays, and download one merged pack for Minecraft Java.",
+    ogTitle: "Downloads | Prime's HD Textures",
+    ogDesc: "Pick a build, a resolution and any add-ons. You get one merged pack, ready to drop into Minecraft."
+  }
+};
+
+const escAttr = s => String(s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function isLiveHost(host) {
+  return host === LIVE_HOST || host === `www.${LIVE_HOST}`;
+}
+
+function headTags(url, path) {
+  const meta = PAGE_META[path] || PAGE_META['/'];
+  const origin = `https://${url.hostname}`;
+  const canonical = path === '/' ? `${origin}/` : `${origin}${path}/`;
+  const tags = [
+    `<meta name="description" content="${escAttr(meta.desc)}">`,
+    '<meta name="theme-color" content="#2b2521">',
+    `<link rel="canonical" href="${canonical}">`,
+    '<link rel="icon" href="/favicon.ico" sizes="32x32">',
+    '<link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">',
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">',
+    `<meta property="og:site_name" content="${escAttr("Prime's HD Textures")}">`,
+    `<meta property="og:title" content="${escAttr(meta.ogTitle)}">`,
+    `<meta property="og:description" content="${escAttr(meta.ogDesc)}">`,
+    '<meta property="og:type" content="website">',
+    `<meta property="og:url" content="${canonical}">`,
+    `<meta property="og:image" content="${origin}/og-card.jpg">`,
+    '<meta property="og:image:width" content="1200">',
+    '<meta property="og:image:height" content="630">',
+    '<meta name="twitter:card" content="summary_large_image">'
+  ];
+  if (!isLiveHost(url.hostname)) tags.push('<meta name="robots" content="noindex, nofollow">');
+  return tags.join('');
+}
+
+async function serveAsset(request, url, path, env) {
+  const res = await env.ASSETS.fetch(request);
+  if (!(res.headers.get('content-type') || '').includes('text/html')) return res;
+  const rewritten = new HTMLRewriter()
+    .on('head', { element: el => el.append(headTags(url, path), { html: true }) })
+    .transform(res);
+  const out = new Response(rewritten.body, rewritten);
+  if (!isLiveHost(url.hostname)) out.headers.set('X-Robots-Tag', 'noindex, nofollow');
+  return out;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -44,14 +109,18 @@ export default {
     if (p === '/api/build-id')         return buildIdLookup(request, env, url);
     if (p === '/api/download')         return handleDownload(request, env, await readCookie(request, env));
 
-    return env.ASSETS.fetch(request);
+    return serveAsset(request, url, p, env);
   }
 };
 
 /* ---------- routes ---------- */
 
+// Reached over plain http (a typed address with no scheme, before any
+// https redirect), url.origin is http:// — and Patreon rejects a redirect URI
+// that doesn't match the registered one exactly. The site is https-only, so
+// pin the scheme rather than trusting the inbound request's.
 function redirectUri(url) {
-  return `${url.origin}/api/patreon/callback`;
+  return `https://${url.host}/api/patreon/callback`;
 }
 
 function login(url, env) {
@@ -67,7 +136,7 @@ function login(url, env) {
 
 async function callback(url, env) {
   const code = url.searchParams.get('code');
-  if (!code) return text('Missing code — Patreon denied or cancelled.', 400);
+  if (!code) return text('Missing code. Patreon denied or cancelled.', 400);
 
   const tokenRes = await fetch(TOKEN_URL, {
     method: 'POST',
@@ -163,7 +232,7 @@ async function buildIdLookup(request, env, url) {
   const token = (url.searchParams.get('token') || url.searchParams.get('id') || '').trim();
   if (!token) return json({ error: 'Pass ?token= the build_id from the pack.' }, 400);
   if (token === 'anonymous')
-    return json({ error: 'That build was downloaded without signing in — 32× free tier.' }, 200);
+    return json({ error: 'That build was downloaded without signing in (32× free tier).' }, 200);
 
   try {
     const uid = await decodeBuildId(token, env.COOKIE_SECRET || 'dev-only-insecure-secret');
