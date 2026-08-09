@@ -16,6 +16,9 @@
 
 import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
+const ENC = new TextEncoder();
+const DEC = new TextDecoder();
+const EMPTY = new Uint8Array(0);
 // Overlay order: later sources override earlier ones on a path collision.
 const ADDONS = {
   'lush-foliage':   'Lush Foliage',
@@ -29,6 +32,47 @@ const BASE_OWNED = new Set(['pack.png', 'pack.mcmeta']);
 
 const BUILD_LABEL = 'Beta 55';
 const MC_LABEL = 'Minecraft Java 26.2';
+
+/* Isolate-level memo of parsed source zips.
+   Parsing a central directory is the single most expensive thing this endpoint
+   does, and the page hits /api/download three times for one download (size
+   preview, preflight, transfer) — plus once per add-on toggle. Without this,
+   a multi-source build re-parses every zip each time and trips the Worker CPU
+   limit (error 1102). Keyed by object key + size, so a reupload invalidates. */
+const INDEX_CACHE = new Map();
+const MCMETA_CACHE = new Map();
+const MCMETA_MAX = 12;              // parsed mcmeta is a few hundred bytes each
+const INDEX_MAX = 4;                // one download touches at most 5 sources
+const INDEX_ENTRY_BUDGET = 40000;   // total zip entries held across cached indexes
+
+function memo(cache, key, make, max) {
+  const hit = cache.get(key);
+  if (hit) { cache.delete(key); cache.set(key, hit); return hit; }
+  const made = make();          // a promise — concurrent callers share one parse
+  cache.set(key, made);
+  made.catch(() => cache.delete(key));
+  while (cache.size > max) cache.delete(cache.keys().next().value);
+  return made;
+}
+
+/* Count-based eviction is not enough for INDEX_CACHE: an index is a parsed
+   central directory, tens of thousands of objects for a big pack. Budget it by
+   total entries so a warm isolate can't accumulate every resolution at once
+   and hit the 128MB ceiling mid-download. */
+function trimIndexCache() {
+  let total = 0;
+  const sized = [];
+  for (const [k, v] of INDEX_CACHE) {
+    const n = v && v.entries ? v.entries.length : 0;
+    total += n;
+    sized.push([k, n]);
+  }
+  for (const [k, n] of sized) {
+    if (total <= INDEX_ENTRY_BUDGET || INDEX_CACHE.size <= 1) break;
+    INDEX_CACHE.delete(k);
+    total -= n;
+  }
+}
 
 export async function handleDownload(request, env, session) {
   const url = new URL(request.url);
@@ -53,10 +97,10 @@ export async function handleDownload(request, env, session) {
   for (const s of slugs) sources.push({ label: ADDONS[s], key: `addons/${s}.zip` });
   if (early) sources.push({ label: 'Early access', key: `early/${res}.zip`, early: true });
 
-  for (const s of sources) {
-    const h = await env.PACKS.head(s.key);
-    if (!h) return err(`That build isn\u2019t uploaded yet (${s.key}).`, check, 404);
-    s.size = h.size;
+  const heads = await Promise.all(sources.map(s => env.PACKS.head(s.key)));
+  for (let i = 0; i < sources.length; i++) {
+    if (!heads[i]) return err(`That build isn\u2019t uploaded yet (${sources[i].key}).`, check, 404);
+    sources[i].size = heads[i].size;
   }
 
   let plan;
@@ -88,7 +132,13 @@ export async function handleDownload(request, env, session) {
    the output byte-for-byte so we can send an exact Content-Length. */
 
 async function buildPlan(env, sources, opts) {
-  for (const s of sources) s.index = await readZipIndex(env.PACKS, s.key, s.size);
+  const idx = await Promise.all(sources.map(s =>
+    memo(INDEX_CACHE, s.key + ':' + s.size,
+      () => readZipIndex(env.PACKS, s.key, s.size), INDEX_MAX)));
+  sources.forEach((s, i) => { s.index = idx[i]; });
+  // Resolved values are in the map now, so their real weight can be measured.
+  for (const [k, v] of INDEX_CACHE) if (v && typeof v.then === 'function') INDEX_CACHE.set(k, await v);
+  trimIndexCache();
 
   // Resolve overlay: later source wins, except the base-owned root files.
   const owner = new Map();
@@ -119,10 +169,10 @@ async function buildPlan(env, sources, opts) {
   });
   entries.push(...generated);
 
-  // Lay out offsets.
+  // Lay out offsets. nameBytes come pre-encoded off the cached index.
   let offset = 0;
   for (const e of entries) {
-    e.nameBytes = new TextEncoder().encode(e.name);
+    if (!e.nameBytes) e.nameBytes = ENC.encode(e.name);
     e.localOffset = offset;
     offset += 30 + e.nameBytes.length + e.compSize;
   }
@@ -133,7 +183,8 @@ async function buildPlan(env, sources, opts) {
     dirSize += 46 + e.nameBytes.length + (e.zip64 ? 12 : 0);
   }
   const needZip64 = dirStart + dirSize > 0xFFFFFFFE || entries.length > 0xFFFE;
-  const comment = new TextEncoder().encode('PHDT-' + buildId);  const totalBytes = dirStart + dirSize +
+  const comment = ENC.encode('PHDT-' + buildId);
+  const totalBytes = dirStart + dirSize +
     (needZip64 ? 56 + 20 : 0) + 22 + comment.length;
 
   return { sources, entries, dirStart, dirSize, needZip64, comment, totalBytes, buildId };
@@ -177,11 +228,15 @@ async function packMeta(env, sources, opts, buildId) {
   }
 }
 
-async function readMcmeta(env, src, e) {
-  let bytes = await readEntryBytes(env.PACKS, src.key, e);
-  if (e.method === 8) bytes = await inflateRaw(bytes);
-  else if (e.method !== 0) return null;
-  try { return JSON.parse(new TextDecoder().decode(bytes)); } catch (x) { return null; }
+// Cached per source: the same three or four mcmeta files are re-read on every
+// preflight otherwise, each costing an R2 range read plus an inflate.
+function readMcmeta(env, src, e) {
+  return memo(MCMETA_CACHE, src.key + ':' + src.size + ':mcmeta', async () => {
+    let bytes = await readEntryBytes(env.PACKS, src.key, e);
+    if (e.method === 8) bytes = await inflateRaw(bytes);
+    else if (e.method !== 0) return null;
+    try { return JSON.parse(DEC.decode(bytes)); } catch (x) { return null; }
+  }, MCMETA_MAX).then(m => m && JSON.parse(JSON.stringify(m)));   // callers mutate it
 }
 
 // pack.mcmeta descriptions can be a plain string or a JSON text component.
@@ -254,7 +309,7 @@ class ByteStream {
   constructor(stream, startPos) {
     this.reader = stream.getReader();
     this.pos = startPos;
-    this.buf = new Uint8Array(0);
+    this.buf = EMPTY;
   }
   async fill() {
     const { done, value } = await this.reader.read();
@@ -287,8 +342,16 @@ class ByteStream {
     let left = n;
     while (left > 0) {
       if (!this.buf.length) await this.fill();
-      const take = Math.min(left, this.buf.length);
-      await w.write(this.buf.subarray(0, take).slice());
+      if (this.buf.length <= left) {
+        // Whole buffer goes out: hand it over instead of copying it.
+        const out = this.buf;
+        this.buf = EMPTY;
+        this.pos += out.length; left -= out.length;
+        await w.write(out);
+        continue;
+      }
+      const take = left;
+      await w.write(this.buf.slice(0, take));
       this.buf = this.buf.subarray(take);
       this.pos += take; left -= take;
     }
@@ -354,7 +417,11 @@ async function readZipIndex(bucket, key, size) {
     const extraLen = rd16(dir, p + 30);
     const commentLen = rd16(dir, p + 32);
     let localOffset = rd32(dir, p + 42);
-    const name = new TextDecoder().decode(dir.subarray(p + 46, p + 46 + nameLen));
+    // Copied, not a subarray: a view would pin the whole multi-MB central
+    // directory buffer alive for as long as this index stays cached.
+    let nameBytes = dir.slice(p + 46, p + 46 + nameLen);
+    let name = DEC.decode(nameBytes);
+    if (name.indexOf('\\') !== -1) { name = name.split('\\').join('/'); nameBytes = ENC.encode(name); }
 
     if (compSize === 0xFFFFFFFF || uncompSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF) {
       const ex = dir.subarray(p + 46 + nameLen, p + 46 + nameLen + extraLen);
@@ -378,8 +445,9 @@ async function readZipIndex(bucket, key, size) {
     // descriptor is simply skipped, since we seek to each entry by offset.
 
     entries.push({
-      name: name.replace(/\\/g, '/'),
-      dir: name.endsWith('/'),
+      name,
+      nameBytes,
+      dir: name.charCodeAt(name.length - 1) === 47,
       method, crc, compSize, uncompSize,
       srcOffset: localOffset + prefix,
       utf8: !!(flags & 0x0800)
@@ -419,7 +487,7 @@ async function inflateRaw(bytes) {
 /* ---------------- zip writing ---------------- */
 
 function storedEntry(name, text) {
-  const data = typeof text === 'string' ? new TextEncoder().encode(text) : text;
+  const data = typeof text === 'string' ? ENC.encode(text) : text;
   return {
     name, data, method: 0, crc: crc32(data),
     compSize: data.length, uncompSize: data.length, utf8: true
@@ -444,7 +512,7 @@ const rd64 = (a, i) => {
 };
 
 function localHeader(e) {
-  const nb = e.nameBytes || (e.nameBytes = new TextEncoder().encode(e.name));
+  const nb = e.nameBytes || (e.nameBytes = ENC.encode(e.name));
   const b = new Uint8Array(30 + nb.length);
   u32(0x04034b50, b, 0);
   u16(e.method === 8 ? 20 : 10, b, 4);
