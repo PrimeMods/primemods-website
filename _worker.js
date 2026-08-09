@@ -105,9 +105,17 @@ export default {
     if (p === '/api/patreon/login')    return login(url, env);
     if (p === '/api/patreon/callback') return callback(url, env);
     if (p === '/api/patreon/me')       return me(request, env);
+    if (p === '/api/patreon/refresh')  return refresh(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
     if (p === '/api/build-id')         return buildIdLookup(request, env, url);
-    if (p === '/api/download')         return handleDownload(request, env, await readCookie(request, env));
+    if (p === '/api/download') {
+      // Entitlement is checked against a re-validated session, so a lapsed
+      // patron can't keep pulling paid builds on a stale cookie.
+      const { session, cookie } = await revalidate(await readCookie(request, env), env, false);
+      const res = await handleDownload(request, env, session);
+      if (cookie) res.headers.append('set-cookie', cookie);
+      return res;
+    }
 
     return serveAsset(request, url, p, env);
   }
@@ -150,7 +158,7 @@ async function callback(url, env) {
     })
   });
   if (!tokenRes.ok) return text(`Token exchange failed: ${await tokenRes.text()}`, 502);
-  const { access_token } = await tokenRes.json();
+  const { access_token, refresh_token } = await tokenRes.json();
 
   const idRes = await fetch(IDENTITY, {
     headers: { authorization: `Bearer ${access_token}` }
@@ -158,6 +166,15 @@ async function callback(url, env) {
   if (!idRes.ok) return text(`Identity fetch failed: ${await idRes.text()}`, 502);
   const body = await idRes.json();
 
+  const session = buildSession(body, env, { at: access_token, rt: refresh_token });
+  const res = new Response(null, { status: 302, headers: { location: '/downloads' } });
+  res.headers.append('set-cookie', await setCookie(session, env));
+  return res;
+}
+
+/* Turn a Patreon identity payload into the session we store. Called both at
+   login and on every re-check, so the two can never drift apart. */
+function buildSession(body, env, tokens) {
   const uid = String(body?.data?.id || '');
   const name = body?.data?.attributes?.full_name || 'Patron';
   const avatar = body?.data?.attributes?.thumb_url ||
@@ -190,7 +207,7 @@ async function callback(url, env) {
     : entitled.length ? 'Supporter'
     : 'Free';
 
-  const session = {
+  return {
     uid,
     name,
     avatar,
@@ -202,23 +219,98 @@ async function callback(url, env) {
     // re-created on Patreon, which is what it did to Supporters.
     paid: staff || entitled.length > 0,
     early: staff || entitled.some(t => EARLY_ACCESS.includes(t)),
+    at: tokens.at,
+    rt: tokens.rt,
+    ck: Date.now(),
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7
   };
+}
 
-  const res = new Response(null, { status: 302, headers: { location: '/downloads' } });
-  res.headers.append('set-cookie', await setCookie(session, env));
+const sessionView = s => ({
+  signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
+  avatar: s.avatar || '', paid: !!s.paid, early: !!s.early,
+  owner: !!s.owner, team: !!s.team, tiers: s.tiers, checkedAt: s.ck || 0
+});
+
+async function me(request, env) {
+  const { session, cookie } = await revalidate(await readCookie(request, env), env, false);
+  const res = json(session ? sessionView(session) : { signedIn: false });
+  if (cookie) res.headers.append('set-cookie', cookie);
   return res;
 }
 
-async function me(request, env) {
-  const s = await readCookie(request, env);
-  return json(
-    s
-      ? { signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
-          avatar: s.avatar || '', paid: !!s.paid, early: !!s.early,
-          owner: !!s.owner, team: !!s.team, tiers: s.tiers }
-      : { signedIn: false }
-  );
+/* The Refresh button. Same work as the hourly check, minus the wait — for the
+   patron who just upgraded and wants their new tier now. */
+async function refresh(request, env) {
+  const cur = await readCookie(request, env);
+  if (!cur) return json({ signedIn: false, refreshed: false });
+  const { session, cookie, ok } = await revalidate(cur, env, true);
+  const res = json({ ...sessionView(session), refreshed: !!ok });
+  if (cookie) res.headers.append('set-cookie', cookie);
+  return res;
+}
+
+/* ---------- keeping the session honest ----------
+   The signed cookie is a snapshot of what Patreon said at login. Left alone it
+   would happily keep granting a cancelled patron their old tier for a week.
+   Once an hour — on whatever request comes first — we ask Patreon again and
+   re-issue the cookie. Access tokens are stored in the cookie itself, so this
+   needs no database and no re-login.
+
+   Failures never downgrade or sign anyone out: a Patreon outage leaves the
+   existing session in place and simply schedules a retry. */
+const CHECK_MS = 1000 * 60 * 60;
+const RETRY_MS = 1000 * 60 * 5;
+
+const fetchIdentity = token =>
+  fetch(IDENTITY, { headers: { authorization: `Bearer ${token}` } });
+
+async function refreshTokens(rt, env) {
+  const r = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: rt,
+      client_id: env.PATREON_CLIENT_ID,
+      client_secret: env.PATREON_CLIENT_SECRET
+    })
+  });
+  if (!r.ok) return null;
+  try { return await r.json(); } catch { return null; }
+}
+
+async function revalidate(session, env, force) {
+  if (!session || !session.at) return { session, cookie: null, ok: false };
+  if (!force && Date.now() - (session.ck || 0) < CHECK_MS)
+    return { session, cookie: null, ok: false };
+
+  // Back off before doing anything, so a failure can't retry on every request.
+  const later = async () => {
+    const s = { ...session, ck: Date.now() - CHECK_MS + RETRY_MS };
+    return { session: s, cookie: await setCookie(s, env), ok: false };
+  };
+
+  let at = session.at, rt = session.rt;
+  let res;
+  try { res = await fetchIdentity(at); } catch { return later(); }
+
+  if (res.status === 401 && rt) {
+    const t = await refreshTokens(rt, env);
+    if (!t || !t.access_token) return later();
+    at = t.access_token;
+    rt = t.refresh_token || rt;
+    try { res = await fetchIdentity(at); } catch { return later(); }
+  }
+  if (!res.ok) return later();
+
+  let body;
+  try { body = await res.json(); } catch { return later(); }
+
+  const next = buildSession(body, env, { at, rt });
+  // A payload for a different account, or none at all, is not a downgrade.
+  if (!next.uid || next.uid !== session.uid) return later();
+  return { session: next, cookie: await setCookie(next, env), ok: true };
 }
 
 /* ---------- leak lookup ----------
