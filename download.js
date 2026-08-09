@@ -419,6 +419,8 @@ async function readZipIndex(bucket, key, size) {
     if (rd32(dir, p) !== 0x02014b50) throw new Error(key + ': bad central directory');
     const flags = rd16(dir, p + 8);
     const method = rd16(dir, p + 10);
+    const mtime = rd16(dir, p + 12);
+    const mdate = rd16(dir, p + 14);
     const crc = rd32(dir, p + 16);
     let compSize = rd32(dir, p + 20);
     let uncompSize = rd32(dir, p + 24);
@@ -457,7 +459,7 @@ async function readZipIndex(bucket, key, size) {
       name,
       nameBytes,
       dir: name.charCodeAt(name.length - 1) === 47,
-      method, crc, compSize, uncompSize,
+      method, crc, compSize, uncompSize, mtime, mdate,
       srcOffset: localOffset + prefix,
       utf8: !!(flags & 0x0800)
     });
@@ -499,9 +501,12 @@ function storedEntry(name, text) {
   const data = typeof text === 'string' ? ENC.encode(text) : text;
   return {
     name, data, method: 0, crc: crc32(data),
-    compSize: data.length, uncompSize: data.length, utf8: true
+    compSize: data.length, uncompSize: data.length, utf8: true,
+    mtime: 0, mdate: DOS_EPOCH_DATE
   };
 }
+
+const DOS_EPOCH_DATE = 33;
 
 const u16 = (v, a, i) => { a[i] = v & 255; a[i + 1] = (v >>> 8) & 255; };
 const u32 = (v, a, i) => {
@@ -527,6 +532,8 @@ function localHeader(e) {
   u16(e.method === 8 ? 20 : 10, b, 4);
   u16(0x0800, b, 6);          // UTF-8 names, no data descriptor
   u16(e.method, b, 8);
+  u16(e.mtime || 0, b, 10);
+  u16(e.mdate || DOS_EPOCH_DATE, b, 12);
   u32(e.crc, b, 14);
   u32(Math.min(e.compSize, 0xFFFFFFFF), b, 18);
   u32(Math.min(e.uncompSize, 0xFFFFFFFF), b, 22);
@@ -544,11 +551,14 @@ function centralHeader(e) {
   u16(e.zip64 ? 45 : (e.method === 8 ? 20 : 10), b, 6);
   u16(0x0800, b, 8);
   u16(e.method, b, 10);
+  u16(e.mtime || 0, b, 12);
+  u16(e.mdate || DOS_EPOCH_DATE, b, 14);
   u32(e.crc, b, 16);
   u32(Math.min(e.compSize, 0xFFFFFFFF), b, 20);
   u32(Math.min(e.uncompSize, 0xFFFFFFFF), b, 24);
   u16(nb.length, b, 28);
   u16(extra, b, 30);
+  u32(0x20, b, 38);                    // FILE_ATTRIBUTE_ARCHIVE
   u32(e.zip64 ? 0xFFFFFFFF : e.localOffset, b, 42);
   b.set(nb, 46);
   if (extra) {
