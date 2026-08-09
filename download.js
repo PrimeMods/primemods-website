@@ -111,7 +111,23 @@ export async function handleDownload(request, env, session) {
   }
 
   if (check)
-    return json({ ok: true, files: plan.entries.length, bytes: plan.totalBytes, sources: sources.length });
+    return json({
+      ok: true,
+      files: plan.entries.length,
+      bytes: plan.totalBytes,
+      sources: sources.length,
+      zip64: plan.needZip64,
+      dirStart: plan.dirStart,
+      dirSize: plan.dirSize,
+      buildId: plan.buildId === 'anonymous' ? 'anonymous' : 'stamped',
+      perSource: plan.sources.map(s => ({
+        key: s.key,
+        size: s.size,
+        indexed: s.index.entries.length,
+        used: plan.entries.filter(e => e.sourceIndex === plan.sources.indexOf(s)).length
+      })),
+      methods: plan.entries.reduce((m, e) => { m[e.method] = (m[e.method] || 0) + 1; return m; }, {})
+    });
 
   const filename = `Prime's HD Textures [${res}x].zip`;
 
@@ -342,15 +358,8 @@ class ByteStream {
     let left = n;
     while (left > 0) {
       if (!this.buf.length) await this.fill();
-      if (this.buf.length <= left) {
-        // Whole buffer goes out: hand it over instead of copying it.
-        const out = this.buf;
-        this.buf = EMPTY;
-        this.pos += out.length; left -= out.length;
-        await w.write(out);
-        continue;
-      }
-      const take = left;
+      const take = Math.min(left, this.buf.length);
+      // Always a copy: the stream must own what it is handed.
       await w.write(this.buf.slice(0, take));
       this.buf = this.buf.subarray(take);
       this.pos += take; left -= take;
