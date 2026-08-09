@@ -386,7 +386,7 @@ async function readZipIndex(bucket, key, size) {
   if (dirOffset === 0xFFFFFFFF || count === 0xFFFF || dirSize === 0xFFFFFFFF) {
     let loc = -1;
     for (let i = eocd - 20; i >= 0; i--) {
-      if (rd32(tail, i) === 0x07064b58) { loc = i; break; }
+      if (rd32(tail, i) === 0x07064b50) { loc = i; break; }
     }
     if (loc < 0) throw new Error(key + ': zip64 locator not found');
     const z64at = Number(rd64(tail, loc + 8));
@@ -532,7 +532,7 @@ function centralHeader(e) {
   const b = new Uint8Array(46 + nb.length + extra);
   u32(0x02014b50, b, 0);
   u16(45, b, 4);
-  u16(e.method === 8 ? 20 : 10, b, 6);
+  u16(e.zip64 ? 45 : (e.method === 8 ? 20 : 10), b, 6);
   u16(0x0800, b, 8);
   u16(e.method, b, 10);
   u32(e.crc, b, 16);
@@ -562,7 +562,7 @@ function zip64End(count, dirSize, dirStart) {
 
 function zip64Locator(at) {
   const b = new Uint8Array(20);
-  u32(0x07064b58, b, 0);
+  u32(0x07064b50, b, 0);
   u64(at, b, 8);
   u32(1, b, 16);
   return b;
@@ -589,7 +589,7 @@ function endRecord(plan) {
 async function stamp(session, env) {
   if (!session || !session.uid) return 'anonymous';
   try {
-    return await encodeBuildId(session.uid, env.COOKIE_SECRET || 'dev-only-insecure-secret');
+    return await encodeBuildId(session.uid, env.COOKIE_SECRET);
   } catch (e) {
     return 'anonymous';
   }

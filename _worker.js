@@ -88,7 +88,17 @@ function headTags(url, path) {
 
 async function serveAsset(request, url, path, env) {
   const res = await env.ASSETS.fetch(request);
-  if (!(res.headers.get('content-type') || '').includes('text/html')) return res;
+  if (!(res.headers.get('content-type') || '').includes('text/html')) {
+    // Unhashed asset names are revalidated on every navigation by default, so
+    // each page change re-checks every screenshot before it can paint. A short
+    // window is enough to cover a page swap without delaying an update.
+    if (url.pathname.includes('/uploads/')) {
+      const out = new Response(res.body, res);
+      out.headers.set('cache-control', 'public, max-age=60');
+      return out;
+    }
+    return res;
+  }
   const rewritten = new HTMLRewriter()
     .on('head', { element: el => el.append(headTags(url, path), { html: true }) })
     .transform(res);
@@ -102,8 +112,14 @@ export default {
     const url = new URL(request.url);
     const p = url.pathname.replace(/\/+$/, '') || '/';
 
+    // Without COOKIE_SECRET, sessions could be forged and every build id
+    // decrypted. Refuse to do anything authenticated rather than quietly
+    // falling back to a known string.
+    if (p.startsWith('/api/') && !env.COOKIE_SECRET)
+      return text('Server misconfigured: COOKIE_SECRET is not set.', 503);
+
     if (p === '/api/patreon/login')    return login(url, env);
-    if (p === '/api/patreon/callback') return callback(url, env);
+    if (p === '/api/patreon/callback') return callback(request, url, env);
     if (p === '/api/patreon/me')       return me(request, env);
     if (p === '/api/patreon/refresh')  return refresh(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
@@ -131,20 +147,48 @@ function redirectUri(url) {
   return `https://${url.host}/api/patreon/callback`;
 }
 
+/* A one-time nonce echoed by Patreon and matched against a cookie only this
+   origin can set. Without it, anyone can hand out a link that silently signs a
+   visitor into the ATTACKER's Patreon account — which, here, would put someone
+   else's id on the leak stamp of every pack they download. */
+const STATE_COOKIE = 'phdt_s';
+
 function login(url, env) {
   if (!env.PATREON_CLIENT_ID) return text('PATREON_CLIENT_ID is not set', 500);
+  const state = b64u(crypto.getRandomValues(new Uint8Array(16)));
   const q = new URLSearchParams({
     response_type: 'code',
     client_id: env.PATREON_CLIENT_ID,
     redirect_uri: redirectUri(url),
-    scope: 'identity identity.memberships campaigns'
+    scope: 'identity identity.memberships campaigns',
+    state
   });
-  return Response.redirect(`${AUTHORIZE}?${q}`, 302);
+  // Lax is enough: the callback arrives as a top-level navigation.
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: `${AUTHORIZE}?${q}`,
+      'set-cookie': `${STATE_COOKIE}=${state}; Path=/api/patreon; Max-Age=600; HttpOnly; Secure; SameSite=Lax`
+    }
+  });
 }
 
-async function callback(url, env) {
+function cookieValue(request, name) {
+  const raw = (request.headers.get('cookie') || '')
+    .split(/;\s*/)
+    .find(c => c.startsWith(`${name}=`));
+  return raw ? raw.slice(name.length + 1) : '';
+}
+
+const clearState = `${STATE_COOKIE}=; Path=/api/patreon; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+
+async function callback(request, url, env) {
   const code = url.searchParams.get('code');
   if (!code) return text('Missing code. Patreon denied or cancelled.', 400);
+
+  const expected = cookieValue(request, STATE_COOKIE);
+  if (!expected || url.searchParams.get('state') !== expected)
+    return text('Login session expired or did not start here. Try signing in again.', 400);
 
   const tokenRes = await fetch(TOKEN_URL, {
     method: 'POST',
@@ -169,6 +213,7 @@ async function callback(url, env) {
   const session = buildSession(body, env, { at: access_token, rt: refresh_token });
   const res = new Response(null, { status: 302, headers: { location: '/downloads' } });
   res.headers.append('set-cookie', await setCookie(session, env));
+  res.headers.append('set-cookie', clearState);
   return res;
 }
 
@@ -327,7 +372,7 @@ async function buildIdLookup(request, env, url) {
     return json({ error: 'That build was downloaded without signing in (32× free tier).' }, 200);
 
   try {
-    const uid = await decodeBuildId(token, env.COOKIE_SECRET || 'dev-only-insecure-secret');
+    const uid = await decodeBuildId(token, env.COOKIE_SECRET);
     return json({ userId: uid, profile: `https://www.patreon.com/user?u=${uid}` });
   } catch (e) {
     return json({
@@ -337,11 +382,24 @@ async function buildIdLookup(request, env, url) {
   }
 }
 
+/* Only a plain same-origin path is honoured. A leading // is protocol-relative
+   outright, and a leading /\ becomes one as soon as the browser normalises the
+   backslash — which is how a naive "starts with /" check turns into an open
+   redirect. Resolve it and confirm the origin survived. */
+function safeNext(next, url) {
+  if (!next || next === '/') return '/';
+  if (!/^\/[^/\\]/.test(next)) return '/';
+  if (/[\u0000-\u001f\\]/.test(next)) return '/';
+  try {
+    const u = new URL(next, url.origin);
+    return u.origin === url.origin ? u.pathname + u.search + u.hash : '/';
+  } catch {
+    return '/';
+  }
+}
+
 function logout(url) {
-  // Stay on whatever page the visitor signed out from. Only same-origin paths
-  // are honoured, so ?next= can't be used as an open redirect.
-  const next = url.searchParams.get('next') || '/';
-  const dest = /^\/(?!\/)/.test(next) ? next : '/';
+  const dest = safeNext(url.searchParams.get('next'), url);
   const res = new Response(null, { status: 302, headers: { location: dest } });
   res.headers.append(
     'set-cookie',
@@ -357,7 +415,7 @@ const enc = new TextEncoder();
 async function key(env) {
   return crypto.subtle.importKey(
     'raw',
-    enc.encode(env.COOKIE_SECRET || 'dev-only-insecure-secret'),
+    enc.encode(env.COOKIE_SECRET),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign', 'verify']
