@@ -31,7 +31,9 @@ bucket_name = "primes-hd-textures"
 #   npx wrangler secret put COOKIE_SECRET
 [vars]
 PATREON_CLIENT_ID = "Ue5jWqFIGGAg5mR1pytqQ0eijnDahZoNDzg-QGMNQSs6_ABGukv0cWaLzdUcx4eo"
-# Optional. The creator account is detected automatically from the campaign it
-# owns; these are for extra accounts that should always have full access.
-OWNER_IDS = ""
+# Accounts that always get full access, by Patreon user id. Owning a Patreon
+# campaign no longer grants anything by itself — every creator on Patreon owns
+# one — so your own id MUST be listed here or you'll show up as Free.
+# Find it by signing in and opening /api/patreon/me.
+OWNER_IDS = "42536237"
 TEAM_IDS = "28982945,165344659,135944510,21501443"

@@ -10,6 +10,8 @@
 // Optional:
 //   OWNER_IDS              comma-separated Patreon user ids with full access
 //   TEAM_IDS               same, for team members
+// Owning a Patreon campaign grants nothing on its own — set OWNER_IDS to your
+// own Patreon user id (visible at /api/patreon/me once signed in).
 
 import { handleDownload } from './download.js';
 import { decodeBuildId } from './buildid.js';
@@ -18,7 +20,7 @@ const AUTHORIZE = 'https://www.patreon.com/oauth2/authorize';
 const TOKEN_URL = 'https://www.patreon.com/api/oauth2/token';
 const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
-  '?include=memberships.currently_entitled_tiers,campaign' +
+  '?include=memberships.currently_entitled_tiers' +
   '&fields%5Bmember%5D=patron_status' +
   '&fields%5Buser%5D=full_name,image_url,thumb_url';
 
@@ -31,6 +33,9 @@ const TIERS = {
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
 
 const COOKIE = 'phdt';
+// Bumped whenever the stored session shape changes in a way that must not be
+// honoured from an old cookie. Old versions are rejected, not migrated.
+const SESSION_V = 2;
 
 // The built pages are self-unpacking bundles: everything except <title> lives
 // inside a template string that only exists once JavaScript runs. Crawlers and
@@ -160,7 +165,7 @@ function login(url, env) {
     response_type: 'code',
     client_id: env.PATREON_CLIENT_ID,
     redirect_uri: redirectUri(url),
-    scope: 'identity identity.memberships campaigns',
+    scope: 'identity identity.memberships',
     state
   });
   // Lax is enough: the callback arrives as a top-level navigation.
@@ -211,6 +216,7 @@ async function callback(request, url, env) {
   const body = await idRes.json();
 
   const session = buildSession(body, env, { at: access_token, rt: refresh_token });
+  if (!session.uid) return text('Patreon returned no account id. Try signing in again.', 502);
   const res = new Response(null, { status: 302, headers: { location: '/downloads' } });
   res.headers.append('set-cookie', await setCookie(session, env));
   res.headers.append('set-cookie', clearState);
@@ -233,43 +239,56 @@ function buildSession(body, env, tokens) {
     }
   }
 
-  // OWNER_IDS / TEAM_IDS: comma-separated Patreon user ids that always get
-  // full access, regardless of what they're subscribed to.
-  const idList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
-  // A creator holds no membership to their own campaign, so tier checks can
-  // never pass for them. The identity payload does name the campaign they own.
-  const ownsCampaign = !!body?.data?.relationships?.campaign?.data ||
-    (body.included || []).some(i => i.type === 'campaign');
-  const owner = ownsCampaign || idList(env.OWNER_IDS).includes(uid);
-  const team = !owner && idList(env.TEAM_IDS).includes(uid);
-  const staff = owner || team;
-
-  const has = t => entitled.includes(t);
-  const tier = owner ? 'Creator'
-    : team ? 'Team Member'
-    : has(TIERS.devCouncil) ? 'Development Council'
-    : has(TIERS.packTester) ? 'Pack Tester'
-    : entitled.length ? 'Supporter'
-    : 'Free';
-
   return {
+    v: SESSION_V,
     uid,
     name,
     avatar,
-    tier,
     tiers: entitled,
-    owner, team,
-    // Any active entitled tier counts as paid. Matching against a hardcoded
-    // list of tier ids silently locks out patrons whenever a tier is added or
-    // re-created on Patreon, which is what it did to Supporters.
-    paid: staff || entitled.length > 0,
-    early: staff || entitled.some(t => EARLY_ACCESS.includes(t)),
     at: tokens.at,
     rt: tokens.rt,
     ck: Date.now(),
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7
   };
 }
+
+/* ---------- entitlements ----------
+   Deliberately NOT stored in the cookie. Everything the download endpoint
+   checks is recomputed here, on every request, from the account id and the
+   tier ids Patreon last reported — so the cookie carries identity, never
+   permission. Editing a payload can at most change WHO you claim to be, and
+   the signature already stops that.
+
+   OWNER_IDS / TEAM_IDS: comma-separated Patreon user ids with full access.
+   Owning a Patreon campaign grants nothing: every creator on Patreon owns
+   one, so treating that as proof of being THIS creator handed the Creator
+   role to anyone with a campaign of their own. */
+const idList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function grants(uid, tiers, env) {
+  const entitled = Array.isArray(tiers) ? tiers.map(String) : [];
+  const owner = !!uid && idList(env.OWNER_IDS).includes(uid);
+  const team = !owner && !!uid && idList(env.TEAM_IDS).includes(uid);
+  const staff = owner || team;
+  const has = t => entitled.includes(t);
+
+  return {
+    owner, team,
+    tier: owner ? 'Creator'
+      : team ? 'Team Member'
+      : has(TIERS.devCouncil) ? 'Development Council'
+      : has(TIERS.packTester) ? 'Pack Tester'
+      : entitled.length ? 'Supporter'
+      : 'Free',
+    // Any active entitled tier counts as paid. Matching against a hardcoded
+    // list of tier ids silently locks out patrons whenever a tier is added or
+    // re-created on Patreon, which is what it did to Supporters.
+    paid: staff || entitled.length > 0,
+    early: staff || entitled.some(t => EARLY_ACCESS.includes(t))
+  };
+}
+
+const GRANT_KEYS = ['owner', 'team', 'tier', 'paid', 'early'];
 
 const sessionView = s => ({
   signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
@@ -355,7 +374,8 @@ async function revalidate(session, env, force) {
   const next = buildSession(body, env, { at, rt });
   // A payload for a different account, or none at all, is not a downgrade.
   if (!next.uid || next.uid !== session.uid) return later();
-  return { session: next, cookie: await setCookie(next, env), ok: true };
+  const cookie = await setCookie(next, env);
+  return { session: { ...next, ...grants(next.uid, next.tiers, env) }, cookie, ok: true };
 }
 
 /* ---------- leak lookup ----------
@@ -433,7 +453,11 @@ const unb64u = s =>
   );
 
 async function setCookie(session, env) {
-  const payload = b64u(enc.encode(JSON.stringify(session)));
+  // Strip anything derived before signing, so a stale grant can never ride
+  // along inside a payload and be mistaken for stored truth later.
+  const stored = { ...session };
+  for (const k of GRANT_KEYS) delete stored[k];
+  const payload = b64u(enc.encode(JSON.stringify(stored)));
   const sig = b64u(await crypto.subtle.sign('HMAC', await key(env), enc.encode(payload)));
   const maxAge = 60 * 60 * 24 * 7;
   return `${COOKIE}=${payload}.${sig}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
@@ -446,14 +470,20 @@ async function readCookie(request, env) {
   if (!raw) return null;
   const [payload, sig] = raw.slice(COOKIE.length + 1).split('.');
   if (!payload || !sig) return null;
-  const ok = await crypto.subtle.verify(
-    'HMAC', await key(env), unb64u(sig), enc.encode(payload)
-  );
-  if (!ok) return null;
   try {
+    const ok = await crypto.subtle.verify(
+      'HMAC', await key(env), unb64u(sig), enc.encode(payload)
+    );
+    if (!ok) return null;
     const s = JSON.parse(new TextDecoder().decode(unb64u(payload)));
-    return s.exp > Date.now() ? s : null;
+    // Cookies minted before grants moved server-side carried their own
+    // owner/paid flags. Refuse them outright rather than reason about them.
+    if (s.v !== SESSION_V) return null;
+    if (!(s.exp > Date.now())) return null;
+    return { ...s, ...grants(String(s.uid || ''), s.tiers, env) };
   } catch {
+    // Malformed base64 throws out of unb64u; a decode failure is a bad cookie,
+    // not a server error.
     return null;
   }
 }
