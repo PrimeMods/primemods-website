@@ -129,6 +129,9 @@ export async function handleDownload(request, env, session) {
       methods: plan.entries.reduce((m, e) => { m[e.method] = (m[e.method] || 0) + 1; return m; }, {})
     });
 
+  if (url.searchParams.get('trace') === '1')
+    return json(await traceArchive(env, plan));
+
   const filename = `Prime's HD Textures [${res}x].zip`;
 
   return new Response(streamZip(env, plan), {
@@ -266,32 +269,52 @@ function describe(meta) {
 
 /* ---------------- output stream ---------------- */
 
+async function writeArchive(env, plan, put, at) {
+  for (let si = 0; si < plan.sources.length; si++) {
+    const src = plan.sources[si];
+    const mine = plan.entries.filter(e => e.sourceIndex === si);
+    if (!mine.length) continue;
+    mine.sort((a, b) => a.srcOffset - b.srcOffset);
+    at.source = src.key;
+    at.entries = mine.length;
+    const before = at.written;
+    const expect = mine.reduce((n, e) => n + 30 + e.nameBytes.length + e.compSize, 0);
+    await copyFromSource(env, src, mine, put, at);
+    if (at.written - before !== expect)
+      throw new Error(`${src.key}: wrote ${at.written - before} of ${expect} bytes`);
+  }
+  at.source = 'generated';
+  for (const e of plan.entries) {
+    if (!e.data) continue;
+    at.entry = e.name;
+    await put(localHeader(e));
+    await put(e.data);
+  }
+  if (at.written !== plan.dirStart)
+    throw new Error(`data region ended at ${at.written}, expected ${plan.dirStart}`);
+  at.source = 'central directory';
+  for (const e of plan.entries) await put(centralHeader(e));
+  if (plan.needZip64) {
+    await put(zip64End(plan.entries.length, plan.dirSize, plan.dirStart));
+    await put(zip64Locator(plan.dirStart + plan.dirSize));
+  }
+  await put(endRecord(plan));
+  if (at.written !== plan.totalBytes)
+    throw new Error(`sent ${at.written} bytes, declared ${plan.totalBytes}`);
+}
+
 function streamZip(env, plan) {
   const { readable, writable } = new TransformStream();
   const w = writable.getWriter();
+  const at = { written: 0, source: null, entry: null, nth: 0 };
+  const put = async bytes => { at.written += bytes.length; await w.write(bytes); };
 
   (async () => {
     try {
-      for (let si = 0; si < plan.sources.length; si++) {
-        const src = plan.sources[si];
-        const mine = plan.entries.filter(e => e.sourceIndex === si);
-        if (!mine.length) continue;
-        mine.sort((a, b) => a.srcOffset - b.srcOffset);
-        await copyFromSource(env, src, mine, w);
-      }
-      for (const e of plan.entries) {
-        if (!e.data) continue;
-        await w.write(localHeader(e));
-        await w.write(e.data);
-      }
-      for (const e of plan.entries) await w.write(centralHeader(e));
-      if (plan.needZip64) {
-        await w.write(zip64End(plan.entries.length, plan.dirSize, plan.dirStart));
-        await w.write(zip64Locator(plan.dirStart + plan.dirSize));
-      }
-      await w.write(endRecord(plan));
+      await writeArchive(env, plan, put, at);
       await w.close();
     } catch (e) {
+      // Better a failed download than a complete-looking, unopenable zip.
       await w.abort(e);
     }
   })();
@@ -299,9 +322,25 @@ function streamZip(env, plan) {
   return readable;
 }
 
+/* Same work, no output. Reports where it stopped. */
+async function traceArchive(env, plan) {
+  const at = { written: 0, source: null, entry: null, nth: 0 };
+  const put = async bytes => { at.written += bytes.length; };
+  try {
+    await writeArchive(env, plan, put, at);
+    return { ok: true, written: at.written, declared: plan.totalBytes };
+  } catch (e) {
+    return {
+      ok: false, written: at.written, declared: plan.totalBytes,
+      stoppedIn: at.source, afterEntries: at.nth, lastEntry: at.entry,
+      error: String((e && e.message) || e)
+    };
+  }
+}
+
 /* One sequential ranged read per source zip: walk its data region in offset
    order, forward the entries we kept and discard the rest. */
-async function copyFromSource(env, src, wanted, w) {
+async function copyFromSource(env, src, wanted, put, at) {
   const first = wanted[0].srcOffset;
 
   const obj = await env.PACKS.get(src.key, { range: { offset: first, length: src.index.dirOffset - first } });
@@ -309,14 +348,16 @@ async function copyFromSource(env, src, wanted, w) {
   const s = new ByteStream(obj.body, first);
 
   for (const e of wanted) {
+    at.entry = e.name;
+    at.nth++;
     await s.skipTo(e.srcOffset);
     const hdr = await s.take(30);
     if (rd32(hdr, 0) !== 0x04034b50) throw new Error(src.key + ': bad local header for ' + e.name);
     await s.skipTo(e.srcOffset + 30 + rd16(hdr, 26) + rd16(hdr, 28));
-    await w.write(localHeader(e));
-    await s.pipe(e.compSize, w);
+    await put(localHeader(e));
+    await s.pipe(e.compSize, put);
   }
-  await s.cancel();
+  s.cancel();
 }
 
 // Exact-length reader over a ReadableStream, with byte-forwarding that never
@@ -354,18 +395,18 @@ class ByteStream {
       this.pos += take; n -= take;
     }
   }
-  async pipe(n, w) {
+  async pipe(n, put) {
     let left = n;
     while (left > 0) {
       if (!this.buf.length) await this.fill();
       const take = Math.min(left, this.buf.length);
       // Always a copy: the stream must own what it is handed.
-      await w.write(this.buf.slice(0, take));
+      await put(this.buf.slice(0, take));
       this.buf = this.buf.subarray(take);
       this.pos += take; left -= take;
     }
   }
-  async cancel() { try { await this.reader.cancel(); } catch (e) {} }
+  cancel() { try { this.reader.cancel().catch(() => {}); } catch (e) {} }
 }
 
 /* ---------------- reading source zips ---------------- */
