@@ -2,9 +2,9 @@ name = "primemods-website"
 main = "_worker.js"
 compatibility_date = "2026-08-04"
 
-# Merging a 256x pack with every add-on is a lot of bytes to move in one
-# request. The default 30s of CPU is close to the line — this buys headroom.
-# Remove this block if a deploy ever rejects it (it needs the Workers Paid plan).
+# Merging a 256x pack with every add-on moves a lot of bytes in one request.
+# The 30s default is close to the line; this buys headroom. You are billed for
+# CPU actually used, not for the ceiling, so raising it costs nothing on its own.
 [limits]
 cpu_ms = 300000
 

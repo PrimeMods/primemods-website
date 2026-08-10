@@ -16,8 +16,13 @@
 
 import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
-// How much of a source zip to hold open at once.
+// How much of a source zip to hold open at once. Holding one range open for a
+// whole client-paced download is what broke; a window is short-lived by design.
+// Each costs a subrequest, and the paid plan allows 1000 per request.
 const WINDOW = 8 * 1024 * 1024;
+// Reopening to skip a gap costs a subrequest too, so only do it when the gap is
+// bigger than the bytes it would save transferring.
+const SEEK_MIN = 512 * 1024;
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
@@ -403,7 +408,7 @@ class ByteStream {
     if (n < 0) throw new Error('pack entries are out of order');
     // A gap bigger than what is already buffered is cheaper to seek over than
     // to transfer and throw away.
-    if (n > this.buf.length + 65536) {
+    if (n > this.buf.length + SEEK_MIN) {
       this.cancel();
       this.reader = null;
       this.buf = EMPTY;
