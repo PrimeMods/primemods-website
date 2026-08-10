@@ -136,9 +136,6 @@ export async function handleDownload(request, env, session) {
       methods: plan.entries.reduce((m, e) => { m[e.method] = (m[e.method] || 0) + 1; return m; }, {})
     });
 
-  if (url.searchParams.get('trace') === '1')
-    return json(await traceArchive(env, plan));
-
   const filename = `Prime's HD Textures [${res}x].zip`;
 
   return new Response(streamZip(env, plan), {
@@ -329,21 +326,6 @@ function streamZip(env, plan) {
   return readable;
 }
 
-/* Same work, no output. Reports where it stopped. */
-async function traceArchive(env, plan) {
-  const at = { written: 0, source: null, entry: null, nth: 0 };
-  const put = async bytes => { at.written += bytes.length; };
-  try {
-    await writeArchive(env, plan, put, at);
-    return { ok: true, written: at.written, declared: plan.totalBytes };
-  } catch (e) {
-    return {
-      ok: false, written: at.written, declared: plan.totalBytes,
-      stoppedIn: at.source, afterEntries: at.nth, lastEntry: at.entry,
-      error: String((e && e.message) || e)
-    };
-  }
-}
 
 /* One sequential ranged read per source zip: walk its data region in offset
    order, forward the entries we kept and discard the rest. */
