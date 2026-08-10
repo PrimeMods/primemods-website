@@ -2,6 +2,12 @@ name = "primemods-website"
 main = "_worker.js"
 compatibility_date = "2026-08-04"
 
+# Merging a 256x pack with every add-on is a lot of bytes to move in one
+# request. The default 30s of CPU is close to the line — this buys headroom.
+# Remove this block if a deploy ever rejects it (it needs the Workers Paid plan).
+[limits]
+cpu_ms = 300000
+
 [assets]
 directory = "./public"
 binding = "ASSETS"

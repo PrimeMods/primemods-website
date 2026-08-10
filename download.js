@@ -16,6 +16,8 @@
 
 import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
+// How much of a source zip to hold open at once.
+const WINDOW = 8 * 1024 * 1024;
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
@@ -341,11 +343,7 @@ async function traceArchive(env, plan) {
 /* One sequential ranged read per source zip: walk its data region in offset
    order, forward the entries we kept and discard the rest. */
 async function copyFromSource(env, src, wanted, put, at) {
-  const first = wanted[0].srcOffset;
-
-  const obj = await env.PACKS.get(src.key, { range: { offset: first, length: src.index.dirOffset - first } });
-  if (!obj) throw new Error('missing ' + src.key);
-  const s = new ByteStream(obj.body, first);
+  const s = new ByteStream(env.PACKS, src.key, wanted[0].srcOffset, src.index.dirOffset);
 
   for (const e of wanted) {
     at.entry = e.name;
@@ -363,20 +361,35 @@ async function copyFromSource(env, src, wanted, put, at) {
 // Exact-length reader over a ReadableStream, with byte-forwarding that never
 // holds more than one chunk.
 class ByteStream {
-  constructor(stream, startPos) {
-    this.reader = stream.getReader();
-    this.pos = startPos;
+  constructor(bucket, key, startPos, end) {
+    this.bucket = bucket;
+    this.key = key;
+    this.pos = startPos;      // where we are in the source file
+    this.next = startPos;     // first byte not yet requested
+    this.end = end;           // never read past the central directory
+    this.reader = null;
     this.buf = EMPTY;
   }
   async fill() {
-    const { done, value } = await this.reader.read();
-    if (done) throw new Error('unexpected end of pack data');
-    const chunk = new Uint8Array(value);
-    if (this.buf.length) {
-      const merged = new Uint8Array(this.buf.length + chunk.length);
-      merged.set(this.buf); merged.set(chunk, this.buf.length);
-      this.buf = merged;
-    } else this.buf = chunk;
+    for (;;) {
+      if (!this.reader) {
+        if (this.next >= this.end) throw new Error('unexpected end of pack data');
+        const length = Math.min(WINDOW, this.end - this.next);
+        const obj = await this.bucket.get(this.key, { range: { offset: this.next, length } });
+        if (!obj) throw new Error('missing ' + this.key);
+        this.reader = obj.body.getReader();
+        this.next += length;
+      }
+      const { done, value } = await this.reader.read();
+      if (done) { this.reader = null; continue; }   // window exhausted, open the next
+      const chunk = new Uint8Array(value);
+      if (this.buf.length) {
+        const merged = new Uint8Array(this.buf.length + chunk.length);
+        merged.set(this.buf); merged.set(chunk, this.buf.length);
+        this.buf = merged;
+      } else this.buf = chunk;
+      return;
+    }
   }
   async take(n) {
     while (this.buf.length < n) await this.fill();
@@ -388,6 +401,15 @@ class ByteStream {
   async skipTo(target) {
     let n = target - this.pos;
     if (n < 0) throw new Error('pack entries are out of order');
+    // A gap bigger than what is already buffered is cheaper to seek over than
+    // to transfer and throw away.
+    if (n > this.buf.length + 65536) {
+      this.cancel();
+      this.reader = null;
+      this.buf = EMPTY;
+      this.pos = this.next = target;
+      return;
+    }
     while (n > 0) {
       if (!this.buf.length) await this.fill();
       const take = Math.min(n, this.buf.length);
@@ -406,7 +428,11 @@ class ByteStream {
       this.pos += take; left -= take;
     }
   }
-  cancel() { try { this.reader.cancel().catch(() => {}); } catch (e) {} }
+  cancel() {
+    if (!this.reader) return;
+    try { this.reader.cancel().catch(() => {}); } catch (e) {}
+    this.reader = null;
+  }
 }
 
 /* ---------------- reading source zips ---------------- */
