@@ -291,7 +291,7 @@ function grants(uid, tiers, env) {
 const GRANT_KEYS = ['owner', 'team', 'tier', 'paid', 'early'];
 
 const sessionView = s => ({
-  signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Supporter',
+  signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Free',
   avatar: s.avatar || '', paid: !!s.paid, early: !!s.early,
   owner: !!s.owner, team: !!s.team, tiers: s.tiers, checkedAt: s.ck || 0
 });
