@@ -13,8 +13,8 @@
 //   base/<res>.zip                 32 | 64 | 128 | 256
 //   addons/<slug>.zip              one file each, resolution agnostic
 //   early/<res>.zip
-//   bedrock/base/<res>.zip         Bedrock Edition, same layout under a prefix
-//   bedrock/early/<res>.zip
+//   bedrock/base/<res>.mcpack      Bedrock Edition, same layout under a prefix
+//   bedrock/early/<res>.mcpack     (.zip is accepted for either as well)
 
 import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
@@ -111,14 +111,25 @@ export async function handleDownload(request, env, session) {
   if (!env.PACKS) return err('File storage isn\u2019t configured yet.', check, 503);
 
   const pre = bedrock ? 'bedrock/' : '';
-  const sources = [{ label: 'base', key: `${pre}base/${res}.zip` }];
-  for (const s of slugs) sources.push({ label: ADDONS[s], key: `addons/${s}.zip` });
-  if (early) sources.push({ label: 'Early access', key: `${pre}early/${res}.zip`, early: true });
+  // Bedrock packs are uploaded as .mcpack. That is a zip with a different
+  // extension, so the assembler is unchanged — only the lookup has to allow it.
+  const ext = bedrock ? ['.mcpack', '.zip'] : ['.zip'];
+  const sources = [{ label: 'base', keys: ext.map(e => `${pre}base/${res}${e}`) }];
+  for (const s of slugs) sources.push({ label: ADDONS[s], keys: [`addons/${s}.zip`] });
+  if (early) sources.push({ label: 'Early access', keys: ext.map(e => `${pre}early/${res}${e}`), early: true });
 
-  const heads = await Promise.all(sources.map(s => env.PACKS.head(s.key)));
+  const found = await Promise.all(sources.map(async s => {
+    for (const key of s.keys) {
+      const h = await env.PACKS.head(key);
+      if (h) return { key, size: h.size };
+    }
+    return null;
+  }));
   for (let i = 0; i < sources.length; i++) {
-    if (!heads[i]) return err(`That build isn\u2019t uploaded yet (${sources[i].key}).`, check, 404);
-    sources[i].size = heads[i].size;
+    if (!found[i])
+      return err('This file doesn\u2019t seem to exist. Contact a moderator in the Discord.', check, 404);
+    sources[i].key = found[i].key;
+    sources[i].size = found[i].size;
   }
 
   let plan;
