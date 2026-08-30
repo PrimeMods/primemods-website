@@ -13,6 +13,8 @@
 //   base/<res>.zip                 32 | 64 | 128 | 256
 //   addons/<slug>.zip              one file each, resolution agnostic
 //   early/<res>.zip
+//   bedrock/base/<res>.zip         Bedrock Edition, same layout under a prefix
+//   bedrock/early/<res>.zip
 
 import { encodeBuildId } from './buildid.js';
 const RESOLUTIONS = [32, 64, 128, 256];
@@ -89,8 +91,16 @@ export async function handleDownload(request, env, session) {
   const slugs = ADDON_ORDER.filter(s =>
     (url.searchParams.get('addons') || '').split(',').map(x => x.trim()).includes(s));
   const early = url.searchParams.get('early') === '1';
+  // Bedrock packs live under their own prefix, so one bucket serves both
+  // editions. Absent or unrecognised means Java.
+  const bedrock = url.searchParams.get('edition') === 'bedrock';
 
   if (!RESOLUTIONS.includes(res)) return err('Unknown resolution.', check, 400);
+  // Bedrock is Creator-only while it's being tested, matching the picker.
+  if (bedrock && !(session && session.owner))
+    return err('Bedrock Edition isn\u2019t released yet.', check, 403);
+  if (bedrock && slugs.length)
+    return err('Add-ons are Java Edition only.', check, 400);
 
   const paid = !!(session && session.paid);
   const canEarly = !!(session && session.early);
@@ -100,9 +110,10 @@ export async function handleDownload(request, env, session) {
     return err('Early access is for Pack Tester and Development Council members.', check, 403);
   if (!env.PACKS) return err('File storage isn\u2019t configured yet.', check, 503);
 
-  const sources = [{ label: 'base', key: `base/${res}.zip` }];
+  const pre = bedrock ? 'bedrock/' : '';
+  const sources = [{ label: 'base', key: `${pre}base/${res}.zip` }];
   for (const s of slugs) sources.push({ label: ADDONS[s], key: `addons/${s}.zip` });
-  if (early) sources.push({ label: 'Early access', key: `early/${res}.zip`, early: true });
+  if (early) sources.push({ label: 'Early access', key: `${pre}early/${res}.zip`, early: true });
 
   const heads = await Promise.all(sources.map(s => env.PACKS.head(s.key)));
   for (let i = 0; i < sources.length; i++) {
@@ -136,13 +147,17 @@ export async function handleDownload(request, env, session) {
       methods: plan.entries.reduce((m, e) => { m[e.method] = (m[e.method] || 0) + 1; return m; }, {})
     });
 
-  const filename = `Prime's HD Textures [${res}x].zip`;
+  // Bedrock imports as .mcpack; the bytes are the same zip either way.
+  // Same name as the Java files apart from the extension: Bedrock imports as
+  // .mcpack, though the bytes are the same zip either way.
+  const suffix = ` [${res}x]` + (bedrock ? '.mcpack' : '.zip');
+  const filename = `Prime's HD Textures${suffix}`;
 
   return new Response(streamZip(env, plan), {
     headers: {
       'content-type': 'application/zip',
       'content-length': String(plan.totalBytes),
-      'content-disposition': `attachment; filename="Primes HD Textures [${res}x].zip"; ` +
+      'content-disposition': `attachment; filename="Primes HD Textures${suffix}"; ` +
         `filename*=UTF-8''${encodeURIComponent(filename)}`,
       'cache-control': 'no-store',
       'x-build-id': plan.buildId
