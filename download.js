@@ -163,7 +163,12 @@ export async function handleDownload(request, env, session) {
 
   return new Response(streamZip(env, plan), {
     headers: {
-      'content-type': 'application/zip',
+      // Android's DownloadManager rewrites the saved name to match the MIME
+      // type: with application/zip it appends .zip, so an .mcpack arrives as
+      // "….mcpack.zip". octet-stream is treated as unknown and the filename in
+      // Content-Disposition is kept verbatim. Desktop and iOS are unaffected
+      // either way; Bedrock clients open the file by extension, not MIME.
+      'content-type': bedrock ? 'application/octet-stream' : 'application/zip',
       'content-length': String(plan.totalBytes),
       'content-disposition': `attachment; filename="Primes HD Textures${suffix}"; ` +
         `filename*=UTF-8''${encodeURIComponent(filename)}`,
