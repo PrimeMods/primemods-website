@@ -96,9 +96,6 @@ export async function handleDownload(request, env, session) {
   const bedrock = url.searchParams.get('edition') === 'bedrock';
 
   if (!RESOLUTIONS.includes(res)) return err('Unknown resolution.', check, 400);
-  // Bedrock is Creator-only while it's being tested, matching the picker.
-  if (bedrock && !(session && session.owner))
-    return err('Bedrock Edition isn\u2019t released yet.', check, 403);
   if (bedrock && slugs.length)
     return err('Add-ons are Java Edition only.', check, 400);
 
@@ -301,10 +298,7 @@ async function packManifest(env, sources, opts, buildId) {
     }
 
     delete man.phdt;
-    // Top level for tooling, and in metadata where Bedrock keeps pack info.
     man.build_id = buildId;
-    if (!man.metadata || typeof man.metadata !== 'object') man.metadata = {};
-    man.metadata.build_id = buildId;
 
     return storedEntry('manifest.json', JSON.stringify(man, null, 2));
   } catch (e) {
