@@ -37,7 +37,7 @@ const ADDONS = {
 const ADDON_ORDER = ['lush-foliage', 'pbr-items', 'block-overlays'];
 
 // Always taken from the base pack — an add-on's copies are ignored.
-const BASE_OWNED = new Set(['pack.png', 'pack.mcmeta']);
+const BASE_OWNED = new Set(['pack.png', 'pack.mcmeta', 'manifest.json']);
 
 const BUILD_LABEL = 'Beta 55';
 const MC_LABEL = 'Minecraft Java 26.2';
@@ -134,7 +134,7 @@ export async function handleDownload(request, env, session) {
 
   let plan;
   try {
-    plan = await buildPlan(env, sources, { res, slugs, early, session });
+    plan = await buildPlan(env, sources, { res, slugs, early, session, bedrock });
   } catch (e) {
     return err('Couldn\u2019t read one of the pack files: ' + e.message, check, 500);
   }
@@ -201,10 +201,13 @@ async function buildPlan(env, sources, opts) {
 
   const buildId = await stamp(opts.session, env);
 
-  // Generated entries replace / add to what came out of the zips.
+  // Generated entries replace / add to what came out of the zips. Java packs
+  // carry pack.mcmeta, Bedrock carries manifest.json; both get the build id.
   const generated = [];
-  const meta = await packMeta(env, sources, opts, buildId);
-  if (meta) { generated.push(meta); owner.delete('pack.mcmeta'); }
+  const meta = opts.bedrock
+    ? await packManifest(env, sources, opts, buildId)
+    : await packMeta(env, sources, opts, buildId);
+  if (meta) { generated.push(meta); owner.delete(meta.name); }
 
   // Output order: base entries first, then each overlay's new files.
   const entries = [];
@@ -247,7 +250,7 @@ async function packMeta(env, sources, opts, buildId) {
     const base = sources[0];
     const baseEntry = base.index.entries.find(x => x.name === 'pack.mcmeta');
     if (!baseEntry) return null;
-    const meta = await readMcmeta(env, base, baseEntry);
+    const meta = await readPackJson(env, base, baseEntry);
     if (!meta || !meta.pack) return null;
 
     // Early access replaces the base description; add-ons append to it.
@@ -257,7 +260,7 @@ async function packMeta(env, sources, opts, buildId) {
     const descOf = async s => {
       if (s === base) return describe(meta);
       const e = s.index.entries.find(x => x.name === 'pack.mcmeta');
-      return e ? describe(await readMcmeta(env, s, e)) : '';
+      return e ? describe(await readPackJson(env, s, e)) : '';
     };
 
     const head = earlySrc ? (await descOf(earlySrc)) || describe(meta) : describe(meta);
@@ -277,10 +280,43 @@ async function packMeta(env, sources, opts, buildId) {
   }
 }
 
-// Cached per source: the same three or four mcmeta files are re-read on every
-// preflight otherwise, each costing an R2 range read plus an inflate.
-function readMcmeta(env, src, e) {
-  return memo(MCMETA_CACHE, src.key + ':' + src.size + ':mcmeta', async () => {
+/* The Bedrock equivalent: manifest.json instead of pack.mcmeta. Same job —
+   describe the build in the in-game pack list and stamp it with the build id, so
+   an .mcpack is traceable to the account that downloaded it exactly as a .zip
+   is. Add-ons are Java-only, so only early access can change the description. */
+async function packManifest(env, sources, opts, buildId) {
+  try {
+    const base = sources[0];
+    const baseEntry = base.index.entries.find(x => x.name === 'manifest.json');
+    if (!baseEntry) return null;
+    const man = await readPackJson(env, base, baseEntry);
+    if (!man || !man.header) return null;
+
+    const earlySrc = sources.find(s => s.early);
+    if (earlySrc && earlySrc !== base) {
+      const e = earlySrc.index.entries.find(x => x.name === 'manifest.json');
+      const em = e ? await readPackJson(env, earlySrc, e) : null;
+      const d = em && em.header && em.header.description;
+      if (typeof d === 'string' && d.trim()) man.header.description = d.trim();
+    }
+
+    delete man.phdt;
+    // Top level for tooling, and in metadata where Bedrock keeps pack info.
+    man.build_id = buildId;
+    if (!man.metadata || typeof man.metadata !== 'object') man.metadata = {};
+    man.metadata.build_id = buildId;
+
+    return storedEntry('manifest.json', JSON.stringify(man, null, 2));
+  } catch (e) {
+    return null; // fall back to copying the base's file verbatim
+  }
+}
+
+// Cached per source and file name: the same three or four small JSON files are
+// re-read on every preflight otherwise, each costing an R2 range read plus an
+// inflate.
+function readPackJson(env, src, e) {
+  return memo(MCMETA_CACHE, src.key + ':' + src.size + ':' + e.name, async () => {
     let bytes = await readEntryBytes(env.PACKS, src.key, e);
     if (e.method === 8) bytes = await inflateRaw(bytes);
     else if (e.method !== 0) return null;
