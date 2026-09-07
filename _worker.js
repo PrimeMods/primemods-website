@@ -22,6 +22,7 @@ const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
   '?include=memberships.currently_entitled_tiers' +
   '&fields%5Bmember%5D=patron_status' +
+  '&fields%5Btier%5D=amount_cents,title' +
   '&fields%5Buser%5D=full_name,image_url,thumb_url';
 
 const TIERS = {
@@ -31,11 +32,13 @@ const TIERS = {
   legacy:     '5960935'  // deprecated tier — treated exactly as Supporter
 };
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
+// Only consulted when Patreon reports a tier without its price (see below).
+const PAID_TIERS = [TIERS.supporter, TIERS.packTester, TIERS.devCouncil, TIERS.legacy];
 
 const COOKIE = 'phdt';
 // Bumped whenever the stored session shape changes in a way that must not be
 // honoured from an old cookie. Old versions are rejected, not migrated.
-const SESSION_V = 2;
+const SESSION_V = 3;
 
 // The built pages are self-unpacking bundles: everything except <title> lives
 // inside a template string that only exists once JavaScript runs. Crawlers and
@@ -230,12 +233,26 @@ function buildSession(body, env, tokens) {
   const name = body?.data?.attributes?.full_name || 'Patron';
   const avatar = body?.data?.attributes?.thumb_url ||
                  body?.data?.attributes?.image_url || '';
+  // Patreon's free membership is a real tier: someone who joins a campaign at
+  // $0 comes back as an active_patron entitled to it. So membership alone is
+  // not proof of payment — the tier's price is.
+  const cents = new Map();
+  for (const inc of body.included || []) {
+    if (inc.type !== 'tier') continue;
+    cents.set(String(inc.id), Number(inc.attributes?.amount_cents));
+  }
   const entitled = [];
   for (const inc of body.included || []) {
     if (inc.type !== 'member') continue;
     if (inc.attributes?.patron_status !== 'active_patron') continue;
     for (const t of inc.relationships?.currently_entitled_tiers?.data || []) {
-      entitled.push(String(t.id));
+      const id = String(t.id);
+      const price = cents.get(id);
+      // A missing price means the payload did not include the tier object.
+      // Falling back to the known paid ids keeps existing patrons working
+      // without letting an unpriced tier grant access by default.
+      const paying = Number.isFinite(price) ? price > 0 : PAID_TIERS.includes(id);
+      if (paying && !entitled.includes(id)) entitled.push(id);
     }
   }
 
@@ -280,9 +297,10 @@ function grants(uid, tiers, env) {
       : has(TIERS.packTester) ? 'Pack Tester'
       : entitled.length ? 'Supporter'
       : 'Free',
-    // Any active entitled tier counts as paid. Matching against a hardcoded
-    // list of tier ids silently locks out patrons whenever a tier is added or
-    // re-created on Patreon, which is what it did to Supporters.
+    // entitled holds PAID tiers only — buildSession drops $0 memberships — so
+    // any entry means money. Deciding this by price rather than by a hardcoded
+    // id list keeps new or re-created tiers working, which is what broke
+    // Supporters before.
     paid: staff || entitled.length > 0,
     early: staff || entitled.some(t => EARLY_ACCESS.includes(t))
   };
