@@ -27,7 +27,7 @@ bucket_name = "primes-hd-textures"
 # then refresh on the 10-minute check instead of instantly.
 [[kv_namespaces]]
 binding = "TIERS_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "252dcca27de445008bc7ed45a810555c"
 
 # Plain-text variables live HERE, not in the dashboard: a deploy replaces the
 # Worker's whole variable set with this block, so anything added by hand in
