@@ -10,6 +10,10 @@
 // Optional:
 //   OWNER_IDS              comma-separated Patreon user ids with full access
 //   TEAM_IDS               same, for team members
+//   PATREON_WEBHOOK_SECRET secret — enables /api/patreon/webhook (see README)
+// Optional binding:
+//   TIERS_KV               KV namespace; webhooks flag changed accounts here so
+//                          the next request re-checks Patreon immediately
 // Owning a Patreon campaign grants nothing on its own — set OWNER_IDS to your
 // own Patreon user id (visible at /api/patreon/me once signed in).
 
@@ -21,7 +25,7 @@ const TOKEN_URL = 'https://www.patreon.com/api/oauth2/token';
 const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
   '?include=memberships.currently_entitled_tiers' +
-  '&fields%5Bmember%5D=patron_status' +
+  '&fields%5Bmember%5D=patron_status,currently_entitled_amount_cents,last_charge_status' +
   '&fields%5Btier%5D=amount_cents,title' +
   '&fields%5Buser%5D=full_name,image_url,thumb_url';
 
@@ -32,13 +36,14 @@ const TIERS = {
   legacy:     '5960935'  // deprecated tier — treated exactly as Supporter
 };
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
-// Only consulted when Patreon reports a tier without its price (see below).
-const PAID_TIERS = [TIERS.supporter, TIERS.packTester, TIERS.devCouncil, TIERS.legacy];
+// Recorded when someone pays but Patreon reports no tier for the pledge, so
+// "is paying" never has to be inferred from a tier id.
+const PAYING = 'paying';
 
 const COOKIE = 'phdt';
 // Bumped whenever the stored session shape changes in a way that must not be
 // honoured from an old cookie. Old versions are rejected, not migrated.
-const SESSION_V = 3;
+const SESSION_V = 4;
 
 // The built pages are self-unpacking bundles: everything except <title> lives
 // inside a template string that only exists once JavaScript runs. Crawlers and
@@ -130,12 +135,16 @@ export default {
     if (p === '/api/patreon/callback') return callback(request, url, env);
     if (p === '/api/patreon/me')       return me(request, env);
     if (p === '/api/patreon/refresh')  return refresh(request, env);
+    if (p === '/api/patreon/debug')    return debugIdentity(request, env);
+    if (p === '/api/patreon/webhook')  return webhook(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
     if (p === '/api/build-id')         return buildIdLookup(request, env, url);
     if (p === '/api/download') {
       // Entitlement is checked against a re-validated session, so a lapsed
-      // patron can't keep pulling paid builds on a stale cookie.
-      const { session, cookie } = await revalidate(await readCookie(request, env), env, false);
+      // patron can't keep pulling paid builds on a stale cookie. Downloads are
+      // the access-critical path, so they tolerate a much shorter snapshot age
+      // than page loads do.
+      const { session, cookie } = await revalidate(await readCookie(request, env), env, false, DOWNLOAD_CHECK_MS);
       const res = await handleDownload(request, env, session);
       if (cookie) res.headers.append('set-cookie', cookie);
       return res;
@@ -234,26 +243,42 @@ function buildSession(body, env, tokens) {
   const avatar = body?.data?.attributes?.thumb_url ||
                  body?.data?.attributes?.image_url || '';
   // Patreon's free membership is a real tier: someone who joins a campaign at
-  // $0 comes back as an active_patron entitled to it. So membership alone is
-  // not proof of payment — the tier's price is.
-  const cents = new Map();
+  // $0 comes back as an active_patron entitled to it, so membership alone is
+  // never proof of payment.
+  //
+  // The authority here is the MEMBER's currently_entitled_amount_cents — what
+  // this account is entitled to right now, in cents. It is on the member
+  // object, so unlike a tier price it is present even when the payload carries
+  // no tier objects at all (which is how the previous id-list fallback ended
+  // up granting the free tier: the free tier reused a known paid tier id).
+  const tierCents = new Map();
   for (const inc of body.included || []) {
     if (inc.type !== 'tier') continue;
-    cents.set(String(inc.id), Number(inc.attributes?.amount_cents));
+    tierCents.set(String(inc.id), Number(inc.attributes?.amount_cents));
   }
+
   const entitled = [];
+  let pledge = 0;
   for (const inc of body.included || []) {
     if (inc.type !== 'member') continue;
-    if (inc.attributes?.patron_status !== 'active_patron') continue;
-    for (const t of inc.relationships?.currently_entitled_tiers?.data || []) {
-      const id = String(t.id);
-      const price = cents.get(id);
-      // A missing price means the payload did not include the tier object.
-      // Falling back to the known paid ids keeps existing patrons working
-      // without letting an unpriced tier grant access by default.
-      const paying = Number.isFinite(price) ? price > 0 : PAID_TIERS.includes(id);
-      if (paying && !entitled.includes(id)) entitled.push(id);
-    }
+    const a = inc.attributes || {};
+    if (a.patron_status !== 'active_patron') continue;
+
+    const ids = (inc.relationships?.currently_entitled_tiers?.data || [])
+      .map(t => String(t.id));
+    const memberCents = Number(a.currently_entitled_amount_cents);
+    // Fall back to the summed tier prices only when the member field is
+    // absent — never to a list of ids.
+    const cents = Number.isFinite(memberCents) ? memberCents
+      : ids.reduce((n, id) => n + (Number(tierCents.get(id)) || 0), 0);
+    if (!(cents > 0)) continue;
+
+    pledge = Math.max(pledge, cents);
+    // Keep the tier ids for role labels (Pack Tester, Dev Council), but only
+    // from a membership that is actually paying.
+    for (const id of ids) if (!entitled.includes(id)) entitled.push(id);
+    // A pledge with no tier attached still counts as paid.
+    if (!ids.length && !entitled.includes(PAYING)) entitled.push(PAYING);
   }
 
   return {
@@ -262,6 +287,7 @@ function buildSession(body, env, tokens) {
     name,
     avatar,
     tiers: entitled,
+    pc: pledge,
     at: tokens.at,
     rt: tokens.rt,
     ck: Date.now(),
@@ -297,10 +323,8 @@ function grants(uid, tiers, env) {
       : has(TIERS.packTester) ? 'Pack Tester'
       : entitled.length ? 'Supporter'
       : 'Free',
-    // entitled holds PAID tiers only — buildSession drops $0 memberships — so
-    // any entry means money. Deciding this by price rather than by a hardcoded
-    // id list keeps new or re-created tiers working, which is what broke
-    // Supporters before.
+    // entitled only ever holds tiers from a membership whose pledge is above
+    // zero (see buildSession), so any entry means money — no id list involved.
     paid: staff || entitled.length > 0,
     early: staff || entitled.some(t => EARLY_ACCESS.includes(t))
   };
@@ -310,8 +334,8 @@ const GRANT_KEYS = ['owner', 'team', 'tier', 'paid', 'early'];
 
 const sessionView = s => ({
   signedIn: true, uid: s.uid, name: s.name, tier: s.tier || 'Free',
-  avatar: s.avatar || '', paid: !!s.paid, early: !!s.early,
-  owner: !!s.owner, team: !!s.team, tiers: s.tiers, checkedAt: s.ck || 0
+  avatar: s.avatar || '', paid: !!s.paid, early: !!s.early, pledgeCents: s.pc || 0, checkedAt: s.ck || 0,
+  owner: !!s.owner, team: !!s.team, tiers: s.tiers
 });
 
 async function me(request, env) {
@@ -321,7 +345,107 @@ async function me(request, env) {
   return res;
 }
 
-/* The Refresh button. Same work as the hourly check, minus the wait — for the
+/* Owner/team-only view of the raw Patreon answer for the signed-in account:
+   what the previous fix was missing was any way to see the payload. Returns
+   membership status, pledge cents and tier ids — never tokens. */
+async function debugIdentity(request, env) {
+  const session = await readCookie(request, env);
+  if (!session || !(session.owner || session.team)) return json({ error: 'not allowed' }, 403);
+  let body;
+  try {
+    const res = await fetchIdentity(session.at);
+    if (!res.ok) return json({ error: 'patreon ' + res.status }, 502);
+    body = await res.json();
+  } catch (e) { return json({ error: String(e) }, 502); }
+
+  const tiers = (body.included || []).filter(i => i.type === 'tier')
+    .map(i => ({ id: String(i.id), title: i.attributes?.title, amount_cents: i.attributes?.amount_cents }));
+  const members = (body.included || []).filter(i => i.type === 'member').map(i => ({
+    patron_status: i.attributes?.patron_status,
+    currently_entitled_amount_cents: i.attributes?.currently_entitled_amount_cents,
+    last_charge_status: i.attributes?.last_charge_status,
+    tier_ids: (i.relationships?.currently_entitled_tiers?.data || []).map(t => String(t.id))
+  }));
+  const built = buildSession(body, env, { at: session.at, rt: session.rt });
+  return json({
+    uid: String(body?.data?.id || ''),
+    members, tiers,
+    resolved: { tiers: built.tiers, pledgeCents: built.pc },
+    grants: grants(built.uid, built.tiers, env)
+  });
+}
+
+/* Patreon → us. Registered in the Patreon developer portal against
+   https://<host>/api/patreon/webhook for the members:* and members:pledge:*
+   triggers. The body is verified with HMAC-MD5 over the raw bytes using the
+   webhook's own secret (X-Patreon-Signature), exactly as Patreon documents.
+   We store nothing from the payload except that the account changed: the
+   next request re-derives everything from the identity API, which keeps a
+   single source of truth. */
+async function webhook(request, env) {
+  if (request.method !== 'POST') return text('POST only', 405);
+  if (!env.PATREON_WEBHOOK_SECRET) return text('PATREON_WEBHOOK_SECRET is not set.', 503);
+  const raw = new Uint8Array(await request.arrayBuffer());
+  const sig = (request.headers.get('x-patreon-signature') || '').toLowerCase();
+  const expect = hmacMd5Hex(enc.encode(env.PATREON_WEBHOOK_SECRET), raw);
+  if (!timingEqual(sig, expect)) return text('Bad signature.', 401);
+
+  let body;
+  try { body = JSON.parse(new TextDecoder().decode(raw)); } catch { return text('Bad JSON.', 400); }
+  const uid = String(body?.data?.relationships?.user?.data?.id || '');
+  const event = request.headers.get('x-patreon-event') || '';
+  if (!uid) return json({ ok: true, ignored: 'no user id', event });
+  if (!env.TIERS_KV) return json({ ok: true, ignored: 'TIERS_KV not bound', event });
+  // Cookies live 7 days; the stamp only has to outlive the oldest cookie.
+  await env.TIERS_KV.put('dirty:' + uid, String(Date.now()), { expirationTtl: 60 * 60 * 24 * 8 });
+  return json({ ok: true, uid, event });
+}
+
+function md5(bytes) {
+  const K = new Uint32Array(64), S = [7,12,17,22,5,9,14,20,4,11,16,23,6,10,15,21];
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  const n = bytes.length, padLen = (((n + 8) >> 6) + 1) << 6;
+  const buf = new Uint8Array(padLen); buf.set(bytes); buf[n] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(padLen - 8, (n * 8) >>> 0, true);
+  dv.setUint32(padLen - 4, Math.floor(n / 536870912), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const M = new Uint32Array(16);
+  for (let off = 0; off < padLen; off += 64) {
+    for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) & 15; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) & 15; }
+      else { F = C ^ (B | ~D); g = (7 * i) & 15; }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      const s = S[(i >> 4) * 4 + (i & 3)];
+      B = (B + ((F << s) | (F >>> (32 - s)))) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  const out = new Uint8Array(16), ov = new DataView(out.buffer);
+  ov.setUint32(0, a0, true); ov.setUint32(4, b0, true); ov.setUint32(8, c0, true); ov.setUint32(12, d0, true);
+  return out;
+}
+const hex = u8 => Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');
+function hmacMd5Hex(keyBytes, msg) {
+  if (keyBytes.length > 64) keyBytes = md5(keyBytes);
+  const k = new Uint8Array(64); k.set(keyBytes);
+  const ipad = k.map(b => b ^ 0x36), opad = k.map(b => b ^ 0x5c);
+  const cat = (a, b) => { const o = new Uint8Array(a.length + b.length); o.set(a); o.set(b, a.length); return o; };
+  return hex(md5(cat(opad, md5(cat(ipad, msg)))));
+}
+function timingEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+/* The Refresh button. Same work as the periodic check, minus the wait — for the
    patron who just upgraded and wants their new tier now. */
 async function refresh(request, env) {
   const cur = await readCookie(request, env);
@@ -335,14 +459,32 @@ async function refresh(request, env) {
 /* ---------- keeping the session honest ----------
    The signed cookie is a snapshot of what Patreon said at login. Left alone it
    would happily keep granting a cancelled patron their old tier for a week.
-   Once an hour — on whatever request comes first — we ask Patreon again and
-   re-issue the cookie. Access tokens are stored in the cookie itself, so this
-   needs no database and no re-login.
+   Three things keep the snapshot current, fastest first:
 
-   Failures never downgrade or sign anyone out: a Patreon outage leaves the
-   existing session in place and simply schedules a retry. */
-const CHECK_MS = 1000 * 60 * 60;
+   1. Patreon webhooks. A pledge create/update/delete for this campaign hits
+      /api/patreon/webhook, which stamps dirty:<uid> in KV. The very next
+      request from that account — page load, focus re-check, download — sees
+      the stamp is newer than its snapshot and re-asks Patreon right away.
+   2. A short periodic check (CHECK_MS) on whatever request comes first, for
+      when webhooks or KV are not configured.
+   3. Downloads re-check after DOWNLOAD_CHECK_MS regardless, and the client's
+      Refresh / "I just upgraded" path forces one.
+
+   Access tokens are stored in the cookie itself, so none of this needs a
+   re-login. Failures never downgrade or sign anyone out: a Patreon outage
+   leaves the existing session in place and simply schedules a retry. */
+const CHECK_MS = 1000 * 60 * 10;
+const DOWNLOAD_CHECK_MS = 1000 * 60 * 2;
 const RETRY_MS = 1000 * 60 * 5;
+// After a failed attempt, a webhook stamp may not retrigger sooner than this.
+const DIRTY_RETRY_MS = 1000 * 30;
+
+/* Webhook stamp for one account: the ms timestamp of the last change Patreon
+   told us about, or 0 when there is none / no KV bound. */
+async function dirtySince(uid, env) {
+  if (!env.TIERS_KV || !uid) return 0;
+  try { return Number(await env.TIERS_KV.get('dirty:' + uid)) || 0; } catch { return 0; }
+}
 
 const fetchIdentity = token =>
   fetch(IDENTITY, { headers: { authorization: `Bearer ${token}` } });
@@ -362,14 +504,20 @@ async function refreshTokens(rt, env) {
   try { return await r.json(); } catch { return null; }
 }
 
-async function revalidate(session, env, force) {
+async function revalidate(session, env, force, maxAge = CHECK_MS) {
   if (!session || !session.at) return { session, cookie: null, ok: false };
-  if (!force && Date.now() - (session.ck || 0) < CHECK_MS)
-    return { session, cookie: null, ok: false };
+  const now = Date.now();
+  if (!force && now - (session.ck || 0) < maxAge) {
+    // Snapshot is young — unless a webhook has flagged this account since it
+    // was taken, in which case it is stale no matter how young it is.
+    const dirty = await dirtySince(session.uid, env);
+    const stale = dirty > (session.ck || 0) && now - (session.la || 0) > DIRTY_RETRY_MS;
+    if (!stale) return { session, cookie: null, ok: false };
+  }
 
   // Back off before doing anything, so a failure can't retry on every request.
   const later = async () => {
-    const s = { ...session, ck: Date.now() - CHECK_MS + RETRY_MS };
+    const s = { ...session, ck: Date.now() - CHECK_MS + RETRY_MS, la: Date.now() };
     return { session: s, cookie: await setCookie(s, env), ok: false };
   };
 
