@@ -13,7 +13,8 @@
 //   PATREON_WEBHOOK_SECRET secret — enables /api/patreon/webhook (see README)
 // Optional binding:
 //   TIERS_KV               KV namespace; webhooks flag changed accounts here so
-//                          the next request re-checks Patreon immediately
+//                          the next request re-checks Patreon immediately, and
+//                          the creator's live site settings live under 'site'
 // Owning a Patreon campaign grants nothing on its own — set OWNER_IDS to your
 // own Patreon user id (visible at /api/patreon/me once signed in).
 
@@ -137,6 +138,7 @@ export default {
     if (p === '/api/patreon/refresh')  return refresh(request, env);
     if (p === '/api/patreon/debug')    return debugIdentity(request, env);
     if (p === '/api/patreon/webhook')  return webhook(request, env);
+    if (p === '/api/site')             return request.method === 'GET' ? siteGet(env) : sitePost(request, env);
     if (p === '/api/patreon/logout')   return logout(url);
     if (p === '/api/build-id')         return buildIdLookup(request, env, url);
     if (p === '/api/download') {
@@ -592,6 +594,100 @@ function logout(url) {
     `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`
   );
   return res;
+}
+
+
+/* ---------- live site settings ----------
+   Small things the creator changes between builds — version names, changelog
+   links, whether the preview build is open. Stored as one JSON record in KV,
+   read by the Downloads page on load, edited through an owner-only panel.
+
+   Who may write: decided HERE, never by the client. The phdt cookie is HMAC-
+   signed, so its uid cannot be forged; owner status is derived from that uid
+   against OWNER_IDS on every request. The "owner" flag the page uses only
+   decides whether to draw the form. */
+const SITE_KEY = 'site';
+const SITE_DEFAULTS = {
+  currentName: 'Update 56',
+  currentLink: 'https://www.patreon.com/primemods/posts/out-now-clarity-168328467?pr=true',
+  previewName: 'Update 57 - Preview 1',
+  previewLink: 'https://www.patreon.com/primemods/posts/coming-sep-1st-168105932',
+  previewEnabled: false,
+  previewSoonLabel: 'COMING SEPTEMBER'
+};
+const SITE_FIELDS = Object.keys(SITE_DEFAULTS);
+
+async function readSite(env) {
+  let stored = null;
+  if (env.TIERS_KV) {
+    try { const raw = await env.TIERS_KV.get(SITE_KEY); stored = raw ? JSON.parse(raw) : null; } catch { stored = null; }
+  }
+  const out = { ...SITE_DEFAULTS };
+  if (stored && typeof stored === 'object') {
+    for (const k of SITE_FIELDS) if (k in stored) out[k] = stored[k];
+    out.updatedAt = Number(stored.updatedAt) || 0;
+  }
+  return out;
+}
+
+/* Strict allow-list validation. Anything not matching is a 400 — no partial
+   writes. Links must be https so a stored value can never become a
+   javascript: href; text is trimmed and stripped of control characters. */
+function cleanSite(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { error: 'Body must be an object.' };
+  for (const k of Object.keys(input)) if (!SITE_FIELDS.includes(k)) return { error: 'Unknown field: ' + k };
+  const out = {};
+  const str = (k, max) => {
+    const v = input[k];
+    if (typeof v !== 'string') return k + ' must be text.';
+    const t = v.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (!t || t.length > max) return k + ' must be 1-' + max + ' characters.';
+    out[k] = t;
+  };
+  const link = (k) => {
+    const v = input[k];
+    if (typeof v !== 'string' || v.length > 400) return k + ' must be a link under 400 characters.';
+    let u; try { u = new URL(v.trim()); } catch { return k + ' is not a valid link.'; }
+    if (u.protocol !== 'https:') return k + ' must start with https://';
+    out[k] = u.href;
+  };
+  const e = str('currentName', 60) || link('currentLink') || str('previewName', 60) || link('previewLink') || str('previewSoonLabel', 40);
+  if (e) return { error: e };
+  if (typeof input.previewEnabled !== 'boolean') return { error: 'previewEnabled must be true or false.' };
+  out.previewEnabled = input.previewEnabled;
+  return { value: out };
+}
+
+async function siteGet(env) {
+  const res = json(await readSite(env));
+  res.headers.set('cache-control', 'no-store');
+  return res;
+}
+
+async function sitePost(request, env) {
+  if (request.method !== 'POST') return text('POST only', 405);
+  // Same-origin only. The cookie is SameSite=Lax, which already keeps it off
+  // cross-site POSTs; the Origin check and the custom header (which forces a
+  // CORS preflight this Worker never answers) close the remaining gaps.
+  const url = new URL(request.url);
+  let originHost = '';
+  try { originHost = new URL(request.headers.get('origin') || '').host; } catch { originHost = ''; }
+  if (!originHost || originHost !== url.host) return text('Cross-origin request refused.', 403);
+  if (request.headers.get('x-phdt') !== 'site') return text('Missing request header.', 403);
+  if (!(request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) return text('JSON only.', 415);
+
+  const session = await readCookie(request, env);          // signature-checked
+  if (!session || !session.uid) return text('Sign in first.', 401);
+  const g = grants(session.uid, session.tiers, env);        // OWNER_IDS, server-side
+  if (!g.owner) return text('Creator account only.', 403);
+  if (!env.TIERS_KV) return text('TIERS_KV is not bound.', 503);
+
+  let body;
+  try { body = await request.json(); } catch { return text('Bad JSON.', 400); }
+  const { value, error } = cleanSite(body);
+  if (error) return json({ ok: false, error }, 400);
+  await env.TIERS_KV.put(SITE_KEY, JSON.stringify({ ...value, updatedAt: Date.now(), updatedBy: session.uid }));
+  return json({ ok: true, site: await readSite(env) });
 }
 
 /* ---------- signed cookie ---------- */

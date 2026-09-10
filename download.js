@@ -105,6 +105,13 @@ export async function handleDownload(request, env, session) {
   if (slugs.length && !paid) return err('Add-ons need a paid Patreon tier.', check, 403);
   if (early && !canEarly)
     return err('Early access is for Pack Tester and Development Council members.', check, 403);
+  // The creator can close the preview from the site settings panel. That has
+  // to hold here too, not just in the page, or a saved URL keeps working.
+  if (early && env.TIERS_KV) {
+    let open = false;
+    try { const raw = await env.TIERS_KV.get('site'); open = !!raw && JSON.parse(raw).previewEnabled === true; } catch { open = false; }
+    if (!open) return err('The preview build is not open for download right now.', check, 403);
+  }
   if (!env.PACKS) return err('File storage isn\u2019t configured yet.', check, 503);
 
   const pre = bedrock ? 'bedrock/' : '';
