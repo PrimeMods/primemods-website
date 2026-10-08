@@ -56,12 +56,12 @@ const LIVE_HOST = 'primemods.net';
 
 const PAGE_META = {
   '/': {
-    desc: "Every vanilla Minecraft texture hand-drawn up to 256\u00d7, with full PBR and 3D depth. Free 32\u00d7 pack, higher resolutions and add-ons on Patreon.",
+    desc: "The official download hub for the Prime's HD Textures resource pack for Minecraft Java and Bedrock. Find the latest releases, resolutions, add-ons, and updates.",
     ogTitle: "Prime's HD Textures",
     ogDesc: "Minecraft's vanilla textures, just uh\u2026 without the pixels."
   },
   '/downloads': {
-    desc: "Build your copy of Prime's HD Textures: pick a resolution from 32\u00d7 to 256\u00d7, add Lush Foliage, PBR Items or Block Overlays, and download one merged pack for Minecraft Java.",
+    desc: "[FREE] 32x, 64x, 128x, 256x, & add-ons. For Java and Bedrock Minecraft.",
     ogTitle: "Downloads | Prime's HD Textures",
     ogDesc: "Pick a build, a resolution and any add-ons. You get one merged pack, ready to drop into Minecraft."
   }
