@@ -25,7 +25,7 @@ const AUTHORIZE = 'https://www.patreon.com/oauth2/authorize';
 const TOKEN_URL = 'https://www.patreon.com/api/oauth2/token';
 const IDENTITY =
   'https://www.patreon.com/api/oauth2/v2/identity' +
-  '?include=memberships.currently_entitled_tiers' +
+  '?include=memberships.currently_entitled_tiers,memberships.campaign' +
   '&fields%5Bmember%5D=patron_status,currently_entitled_amount_cents,last_charge_status' +
   '&fields%5Btier%5D=amount_cents,title' +
   '&fields%5Buser%5D=full_name,image_url,thumb_url';
@@ -37,14 +37,16 @@ const TIERS = {
   legacy:     '5960935'  // deprecated tier — treated exactly as Supporter
 };
 const EARLY_ACCESS = [TIERS.packTester, TIERS.devCouncil];
-// Recorded when someone pays but Patreon reports no tier for the pledge, so
-// "is paying" never has to be inferred from a tier id.
-const PAYING = 'paying';
+// The only tier ids that can ever grant anything. Patreon's identity payload
+// lists the user's memberships to EVERY campaign on Patreon, so a paying
+// patron of some other creator looks exactly like a paying patron of this one
+// unless the tier ids are checked against this list.
+const OUR_TIERS = Object.values(TIERS);
 
 const COOKIE = 'phdt';
 // Bumped whenever the stored session shape changes in a way that must not be
 // honoured from an old cookie. Old versions are rejected, not migrated.
-const SESSION_V = 4;
+const SESSION_V = 5;
 
 // The built pages are self-unpacking bundles: everything except <title> lives
 // inside a template string that only exists once JavaScript runs. Crawlers and
@@ -244,21 +246,11 @@ function buildSession(body, env, tokens) {
   const name = body?.data?.attributes?.full_name || 'Patron';
   const avatar = body?.data?.attributes?.thumb_url ||
                  body?.data?.attributes?.image_url || '';
-  // Patreon's free membership is a real tier: someone who joins a campaign at
-  // $0 comes back as an active_patron entitled to it, so membership alone is
-  // never proof of payment.
-  //
-  // The authority here is the MEMBER's currently_entitled_amount_cents — what
-  // this account is entitled to right now, in cents. It is on the member
-  // object, so unlike a tier price it is present even when the payload carries
-  // no tier objects at all (which is how the previous id-list fallback ended
-  // up granting the free tier: the free tier reused a known paid tier id).
-  const tierCents = new Map();
-  for (const inc of body.included || []) {
-    if (inc.type !== 'tier') continue;
-    tierCents.set(String(inc.id), Number(inc.attributes?.amount_cents));
-  }
-
+  // The identity payload carries one member object per campaign this user
+  // belongs to — all of Patreon, not just this one. So the ONLY thing that
+  // counts is an active membership whose currently_entitled_tiers includes one
+  // of OUR paid tier ids. Pledge amounts, patron_status on their own, and
+  // memberships with no recognised tier grant nothing, whatever they say.
   const entitled = [];
   let pledge = 0;
   for (const inc of body.included || []) {
@@ -266,21 +258,13 @@ function buildSession(body, env, tokens) {
     const a = inc.attributes || {};
     if (a.patron_status !== 'active_patron') continue;
 
-    const ids = (inc.relationships?.currently_entitled_tiers?.data || [])
-      .map(t => String(t.id));
-    const memberCents = Number(a.currently_entitled_amount_cents);
-    // Fall back to the summed tier prices only when the member field is
-    // absent — never to a list of ids.
-    const cents = Number.isFinite(memberCents) ? memberCents
-      : ids.reduce((n, id) => n + (Number(tierCents.get(id)) || 0), 0);
-    if (!(cents > 0)) continue;
+    const ours = (inc.relationships?.currently_entitled_tiers?.data || [])
+      .map(t => String(t.id))
+      .filter(id => OUR_TIERS.includes(id));
+    if (!ours.length) continue;
 
-    pledge = Math.max(pledge, cents);
-    // Keep the tier ids for role labels (Pack Tester, Dev Council), but only
-    // from a membership that is actually paying.
-    for (const id of ids) if (!entitled.includes(id)) entitled.push(id);
-    // A pledge with no tier attached still counts as paid.
-    if (!ids.length && !entitled.includes(PAYING)) entitled.push(PAYING);
+    pledge = Math.max(pledge, Number(a.currently_entitled_amount_cents) || 0);
+    for (const id of ours) if (!entitled.includes(id)) entitled.push(id);
   }
 
   return {
@@ -311,7 +295,9 @@ function buildSession(body, env, tokens) {
 const idList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
 
 function grants(uid, tiers, env) {
-  const entitled = Array.isArray(tiers) ? tiers.map(String) : [];
+  // Re-filtered here too: nothing outside OUR_TIERS can reach a grant even
+  // from a cookie minted by an older build.
+  const entitled = (Array.isArray(tiers) ? tiers.map(String) : []).filter(t => OUR_TIERS.includes(t));
   const owner = !!uid && idList(env.OWNER_IDS).includes(uid);
   const team = !owner && !!uid && idList(env.TEAM_IDS).includes(uid);
   const staff = owner || team;
@@ -325,8 +311,7 @@ function grants(uid, tiers, env) {
       : has(TIERS.packTester) ? 'Pack Tester'
       : entitled.length ? 'Supporter'
       : 'Free',
-    // entitled only ever holds tiers from a membership whose pledge is above
-    // zero (see buildSession), so any entry means money — no id list involved.
+    // entitled only holds this campaign's paid tier ids (see buildSession).
     paid: staff || entitled.length > 0,
     early: staff || entitled.some(t => EARLY_ACCESS.includes(t))
   };
@@ -363,6 +348,7 @@ async function debugIdentity(request, env) {
   const tiers = (body.included || []).filter(i => i.type === 'tier')
     .map(i => ({ id: String(i.id), title: i.attributes?.title, amount_cents: i.attributes?.amount_cents }));
   const members = (body.included || []).filter(i => i.type === 'member').map(i => ({
+    campaign_id: String(i.relationships?.campaign?.data?.id || ''),
     patron_status: i.attributes?.patron_status,
     currently_entitled_amount_cents: i.attributes?.currently_entitled_amount_cents,
     last_charge_status: i.attributes?.last_charge_status,
